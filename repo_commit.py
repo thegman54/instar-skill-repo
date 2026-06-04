@@ -88,8 +88,8 @@ class RepoCommitTool(BaseTool):
             if stage_result.returncode != 0:
                 return ToolResult.fail(f"Stage error: {stage_result.stderr}")
 
-            # Commit with co-author
-            full_message = f"{message}\n\nCo-Authored-By: Seven <seven@instar.local>"
+            # Commit with co-author tag
+            full_message = f"{message}\n\nCo-Authored-By: Instar Bot <bot@instar.local>"
 
             commit_result = subprocess.run(
                 ["git", "commit", "-m", full_message],
