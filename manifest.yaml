@@ -1,0 +1,14 @@
+name: repo
+display_name: Repository
+description: Read, write, commit, push, and manage git repositories
+category: Repository
+icon: folder
+color: orange
+version: 1.0.0
+
+# No credentials — uses grant metadata for project scoping
+credentials: []
+
+grant_metadata:
+  - key: project_root
+    description: Filesystem path to the git repository
