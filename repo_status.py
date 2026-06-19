@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import resolve_repo_path, validate_project_root
+from .base import check_repo_access, validate_project_root
 
 
 @register_tool
@@ -26,24 +26,16 @@ class RepoStatusTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "repo": {
-                    "type": "string",
-                    "description": "Repository in owner/repo format",
-                },
+                "repo": {"type": "string", "description": "Repository in owner/repo format"},
             },
             "required": ["repo"],
         }
-
-    @property
-    def requires_grant_metadata(self) -> list[str]:
-        return ["allowed_repos"]
 
     def credential_keys(self) -> list[str]:
         return []
 
     async def execute(self, repo: str, **kwargs) -> ToolResult:
-        allowed_repos = self.get_grant_metadata("allowed_repos")
-        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+        valid, project_root, access, error = await check_repo_access(repo, "status")
         if not valid:
             return ToolResult.fail(error)
 
@@ -54,26 +46,17 @@ class RepoStatusTool(BaseTool):
         try:
             result = subprocess.run(
                 ["git", "status", "--porcelain"],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=15,
+                cwd=project_root, capture_output=True, text=True, timeout=15,
             )
-
             if result.returncode != 0:
                 return ToolResult.fail(f"Git error: {result.stderr}")
 
-            staged = []
-            modified = []
-            untracked = []
-
+            staged, modified, untracked = [], [], []
             for line in result.stdout.strip().split('\n'):
                 if not line.strip():
                     continue
-                index_status = line[0]
-                work_status = line[1]
+                index_status, work_status = line[0], line[1]
                 filepath = line[3:]
-
                 if index_status in ('A', 'M', 'D', 'R', 'C'):
                     staged.append(filepath)
                 if work_status == 'M':
@@ -83,21 +66,15 @@ class RepoStatusTool(BaseTool):
 
             branch_result = subprocess.run(
                 ["git", "branch", "--show-current"],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=5,
+                cwd=project_root, capture_output=True, text=True, timeout=5,
             )
             branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "unknown"
 
             return ToolResult.ok({
-                "branch": branch,
-                "staged": staged,
-                "modified": modified,
-                "untracked": untracked,
+                "branch": branch, "staged": staged,
+                "modified": modified, "untracked": untracked,
                 "clean": not staged and not modified and not untracked,
             })
-
         except subprocess.TimeoutExpired:
             return ToolResult.fail("Git command timed out")
         except Exception as e:

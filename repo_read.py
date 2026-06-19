@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import resolve_repo_path, validate_path, validate_project_root
+from .base import check_repo_access, validate_path, validate_project_root
 
 
 @register_tool
@@ -46,23 +46,14 @@ class RepoReadTool(BaseTool):
             "required": ["repo", "path"],
         }
 
-    @property
-    def requires_grant_metadata(self) -> list[str]:
-        return ["allowed_repos"]
-
     def credential_keys(self) -> list[str]:
         return []
 
     async def execute(
-        self,
-        repo: str,
-        path: str,
-        start_line: int = None,
-        end_line: int = None,
-        **kwargs
+        self, repo: str, path: str,
+        start_line: int = None, end_line: int = None, **kwargs
     ) -> ToolResult:
-        allowed_repos = self.get_grant_metadata("allowed_repos")
-        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+        valid, project_root, access, error = await check_repo_access(repo, "read")
         if not valid:
             return ToolResult.fail(error)
 
@@ -75,10 +66,8 @@ class RepoReadTool(BaseTool):
             return ToolResult.fail(error)
 
         file_path = Path(abs_path)
-
         if not file_path.exists():
             return ToolResult.fail(f"File not found: {path}")
-
         if not file_path.is_file():
             return ToolResult.fail(f"Not a file: {path}")
 
@@ -99,12 +88,9 @@ class RepoReadTool(BaseTool):
                 content = content[:max_chars]
 
             return ToolResult.ok({
-                "path": path,
-                "content": content,
-                "total_lines": total_lines,
-                "lines_returned": len(lines),
+                "path": path, "content": content,
+                "total_lines": total_lines, "lines_returned": len(lines),
                 "truncated": truncated,
             })
-
         except Exception as e:
             return ToolResult.fail(f"Read error: {str(e)}")

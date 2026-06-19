@@ -4,12 +4,12 @@ description: Clone, read, write, search, commit, push, and manage git repositori
 category: Repository
 icon: folder
 color: orange
-version: 2.0.0
+version: 2.1.0
+database: true
+admin_panel: admin.html
+admin_label: Repos
+admin_api: admin_api.py
 
 credentials:
   - key: GITHUB_TOKEN
     description: GitHub Personal Access Token for clone/push operations
-
-grant_metadata:
-  - key: allowed_repos
-    description: Comma-separated list of allowed GitHub repos (e.g. "owner/repo1,owner/repo2") or "*" for any

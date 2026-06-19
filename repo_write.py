@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import resolve_repo_path, validate_path, validate_project_root
+from .base import check_repo_access, validate_path, validate_project_root
 
 
 @register_tool
@@ -30,43 +30,19 @@ class RepoWriteTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "repo": {
-                    "type": "string",
-                    "description": "Repository in owner/repo format",
-                },
-                "path": {
-                    "type": "string",
-                    "description": "File path relative to repository root",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Content to write to the file",
-                },
-                "create_parents": {
-                    "type": "boolean",
-                    "description": "Create parent directories if they don't exist (default: true)",
-                },
+                "repo": {"type": "string", "description": "Repository in owner/repo format"},
+                "path": {"type": "string", "description": "File path relative to repository root"},
+                "content": {"type": "string", "description": "Content to write to the file"},
+                "create_parents": {"type": "boolean", "description": "Create parent directories if they don't exist (default: true)"},
             },
             "required": ["repo", "path", "content"],
         }
 
-    @property
-    def requires_grant_metadata(self) -> list[str]:
-        return ["allowed_repos"]
-
     def credential_keys(self) -> list[str]:
         return []
 
-    async def execute(
-        self,
-        repo: str,
-        path: str,
-        content: str,
-        create_parents: bool = True,
-        **kwargs
-    ) -> ToolResult:
-        allowed_repos = self.get_grant_metadata("allowed_repos")
-        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+    async def execute(self, repo: str, path: str, content: str, create_parents: bool = True, **kwargs) -> ToolResult:
+        valid, project_root, access, error = await check_repo_access(repo, "write")
         if not valid:
             return ToolResult.fail(error)
 
@@ -79,7 +55,6 @@ class RepoWriteTool(BaseTool):
             return ToolResult.fail(error)
 
         file_path = Path(abs_path)
-
         try:
             if create_parents:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -94,6 +69,5 @@ class RepoWriteTool(BaseTool):
                 "action": "updated" if existed else "created",
                 "bytes": len(content.encode('utf-8')),
             })
-
         except Exception as e:
             return ToolResult.fail(f"Write error: {str(e)}")

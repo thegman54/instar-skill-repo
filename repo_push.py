@@ -7,7 +7,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import resolve_repo_path, sanitize_stderr, validate_project_root
+from .base import check_repo_access, sanitize_stderr, validate_project_root
 
 
 @register_tool
@@ -27,38 +27,18 @@ class RepoPushTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "repo": {
-                    "type": "string",
-                    "description": "Repository in owner/repo format",
-                },
-                "branch": {
-                    "type": "string",
-                    "description": "Branch to push (default: current branch)",
-                },
-                "set_upstream": {
-                    "type": "boolean",
-                    "description": "Set upstream tracking (default: true for new branches)",
-                },
+                "repo": {"type": "string", "description": "Repository in owner/repo format"},
+                "branch": {"type": "string", "description": "Branch to push (default: current branch)"},
+                "set_upstream": {"type": "boolean", "description": "Set upstream tracking (default: true)"},
             },
             "required": ["repo"],
         }
 
-    @property
-    def requires_grant_metadata(self) -> list[str]:
-        return ["allowed_repos"]
-
     def credential_keys(self) -> list[str]:
         return ["GITHUB_TOKEN"]
 
-    async def execute(
-        self,
-        repo: str,
-        branch: str = None,
-        set_upstream: bool = True,
-        **kwargs
-    ) -> ToolResult:
-        allowed_repos = self.get_grant_metadata("allowed_repos")
-        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+    async def execute(self, repo: str, branch: str = None, set_upstream: bool = True, **kwargs) -> ToolResult:
+        valid, project_root, access, error = await check_repo_access(repo, "push")
         if not valid:
             return ToolResult.fail(error)
 
@@ -72,10 +52,7 @@ class RepoPushTool(BaseTool):
             # Verify remote points to the expected repo
             remote_result = subprocess.run(
                 ["git", "remote", "get-url", "origin"],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=10,
+                cwd=project_root, capture_output=True, text=True, timeout=10,
             )
             if remote_result.returncode == 0:
                 current_remote = remote_result.stdout.strip()
@@ -88,26 +65,18 @@ class RepoPushTool(BaseTool):
             auth_url = f"https://x-access-token:{token}@github.com/{repo}.git"
             subprocess.run(
                 ["git", "remote", "set-url", "origin", auth_url],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=10,
+                cwd=project_root, capture_output=True, text=True, timeout=10,
             )
 
-            # Get current branch if not specified
             if not branch:
                 branch_result = subprocess.run(
                     ["git", "branch", "--show-current"],
-                    cwd=project_root,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
+                    cwd=project_root, capture_output=True, text=True, timeout=10,
                 )
                 if branch_result.returncode != 0:
                     return ToolResult.fail("Could not determine current branch")
                 branch = branch_result.stdout.strip()
 
-            # Push
             cmd = ["git", "push"]
             if set_upstream:
                 cmd.extend(["-u", "origin", branch])
@@ -115,11 +84,7 @@ class RepoPushTool(BaseTool):
                 cmd.extend(["origin", branch])
 
             result = subprocess.run(
-                cmd,
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=60,
+                cmd, cwd=project_root, capture_output=True, text=True, timeout=60,
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             )
 
@@ -127,10 +92,7 @@ class RepoPushTool(BaseTool):
             clean_url = f"https://github.com/{repo}.git"
             subprocess.run(
                 ["git", "remote", "set-url", "origin", clean_url],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=5,
+                cwd=project_root, capture_output=True, text=True, timeout=5,
             )
 
             if result.returncode != 0:
@@ -140,14 +102,11 @@ class RepoPushTool(BaseTool):
                 return ToolResult.fail(f"Push error: {sanitize_stderr(result.stderr)}")
 
             return ToolResult.ok({
-                "repo": repo,
-                "branch": branch,
-                "pushed": True,
+                "repo": repo, "branch": branch, "pushed": True,
                 "output": sanitize_stderr(result.stderr.strip()),
             })
 
         except subprocess.TimeoutExpired:
-            # Best-effort cleanup of token from remote
             try:
                 subprocess.run(
                     ["git", "remote", "set-url", "origin", f"https://github.com/{repo}.git"],

@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import resolve_repo_path, validate_project_root
+from .base import check_repo_access, validate_project_root
 
 
 @register_tool
@@ -26,38 +26,18 @@ class RepoDiffTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "repo": {
-                    "type": "string",
-                    "description": "Repository in owner/repo format",
-                },
-                "staged": {
-                    "type": "boolean",
-                    "description": "Show staged changes instead of unstaged (default: false)",
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Limit diff to specific file or directory",
-                },
+                "repo": {"type": "string", "description": "Repository in owner/repo format"},
+                "staged": {"type": "boolean", "description": "Show staged changes instead of unstaged (default: false)"},
+                "path": {"type": "string", "description": "Limit diff to specific file or directory"},
             },
             "required": ["repo"],
         }
 
-    @property
-    def requires_grant_metadata(self) -> list[str]:
-        return ["allowed_repos"]
-
     def credential_keys(self) -> list[str]:
         return []
 
-    async def execute(
-        self,
-        repo: str,
-        staged: bool = False,
-        path: str = None,
-        **kwargs
-    ) -> ToolResult:
-        allowed_repos = self.get_grant_metadata("allowed_repos")
-        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+    async def execute(self, repo: str, staged: bool = False, path: str = None, **kwargs) -> ToolResult:
+        valid, project_root, access, error = await check_repo_access(repo, "diff")
         if not valid:
             return ToolResult.fail(error)
 
@@ -72,14 +52,7 @@ class RepoDiffTool(BaseTool):
             if path:
                 cmd.extend(["--", path])
 
-            result = subprocess.run(
-                cmd,
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-
+            result = subprocess.run(cmd, cwd=project_root, capture_output=True, text=True, timeout=30)
             if result.returncode != 0:
                 return ToolResult.fail(f"Diff error: {result.stderr}")
 
@@ -90,12 +63,9 @@ class RepoDiffTool(BaseTool):
                 output = output[:max_chars]
 
             return ToolResult.ok({
-                "staged": staged,
-                "diff": output,
-                "truncated": truncated,
-                "empty": not output.strip(),
+                "staged": staged, "diff": output,
+                "truncated": truncated, "empty": not output.strip(),
             })
-
         except subprocess.TimeoutExpired:
             return ToolResult.fail("Diff timed out")
         except Exception as e:

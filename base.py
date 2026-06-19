@@ -3,6 +3,10 @@ Repo Tools Base - Path validation, workspace resolution, and security utilities.
 
 SECURITY: All file operations MUST go through validate_path().
 This prevents directory traversal and access to unauthorized projects.
+
+Repository access is controlled by the skill_repo_config table,
+managed through the admin panel. Tools call check_repo_access()
+to validate access and get the permitted operation level.
 """
 
 import os
@@ -26,36 +30,64 @@ REPO_PATTERN = re.compile(r'^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$')
 # Pattern to strip tokens from git URLs in error messages
 _TOKEN_URL_PATTERN = re.compile(r'https://[^@]+@github\.com/')
 
+# Access levels and what operations they allow
+ACCESS_LEVELS = {
+    "full":      {"clone", "read", "list", "grep", "status", "diff", "log", "branch", "write", "commit", "push", "pr", "actions"},
+    "no-push":   {"clone", "read", "list", "grep", "status", "diff", "log", "branch", "write", "commit"},
+    "read-only": {"clone", "read", "list", "grep", "status", "diff", "log", "branch"},
+}
+
 
 def sanitize_stderr(stderr: str) -> str:
     """Strip any embedded tokens from git stderr output before returning to bot."""
     return _TOKEN_URL_PATTERN.sub('https://github.com/', stderr)
 
 
-def resolve_repo_path(repo: str, allowed_repos: str) -> tuple[bool, str, str]:
+async def check_repo_access(repo: str, operation: str = "read") -> tuple[bool, str, str, str]:
     """
-    Validate a repo identifier against the allowed list and resolve its workspace path.
+    Check if a repo is allowed and the operation is permitted.
+
+    Queries the skill_repo_config table for access control.
 
     Args:
         repo: Repository in "owner/repo" format
-        allowed_repos: Comma-separated allowed repos or "*" for any
+        operation: The operation being attempted (clone, read, write, push, pr, etc.)
 
     Returns:
-        (valid, workspace_path, error_message)
+        (valid, workspace_path, access_level, error_message)
     """
     if not repo:
-        return False, "", "No repo specified"
+        return False, "", "", "No repo specified"
 
     if not REPO_PATTERN.match(repo):
-        return False, "", f"Invalid repo format '{repo}' — use 'owner/repo'"
+        return False, "", "", f"Invalid repo format '{repo}' — use 'owner/repo'"
 
-    # Check against allowed list
-    if allowed_repos != "*":
-        allowed = [r.strip() for r in allowed_repos.split(",") if r.strip()]
-        if repo not in allowed:
-            log.warning("repo_not_allowed", repo=repo, allowed=allowed)
-            return False, "", f"Repo '{repo}' is not in the allowed list"
+    # Check DB for access config
+    from ...db import get_pool
+    pool = get_pool()
+    if not pool:
+        log.warning("repo_access_check_no_db")
+        return False, "", "", "Database not available for access check"
 
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT repo, access, enabled FROM skill_repo_config WHERE repo = $1",
+            repo,
+        )
+
+    if not row:
+        return False, "", "", f"Repository '{repo}' is not configured — add it in the Repos admin panel"
+
+    if not row["enabled"]:
+        return False, "", "", f"Repository '{repo}' is disabled"
+
+    access = row["access"]
+    allowed_ops = ACCESS_LEVELS.get(access, set())
+
+    if operation not in allowed_ops:
+        return False, "", access, f"Operation '{operation}' not allowed — repo has '{access}' access"
+
+    # Resolve workspace path
     workspace_path = os.path.join(WORKSPACE_ROOT, repo)
 
     # Check blocked paths
@@ -63,9 +95,9 @@ def resolve_repo_path(repo: str, allowed_repos: str) -> tuple[bool, str, str]:
     for blocked in BLOCKED_PATHS:
         if resolved.startswith(blocked) or blocked.startswith(resolved):
             log.warning("blocked_repo_access", repo=repo, resolved=resolved)
-            return False, "", "Access to this repository is forbidden"
+            return False, "", "", "Access to this repository is forbidden"
 
-    return True, workspace_path, ""
+    return True, workspace_path, access, ""
 
 
 def validate_path(project_root: str, relative_path: str) -> tuple[bool, str, str]:
@@ -138,5 +170,3 @@ def validate_project_root(project_root: str) -> tuple[bool, str]:
         return False, f"Project path is not a directory: {project_root}"
 
     return True, ""
-
-

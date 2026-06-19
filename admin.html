@@ -1,0 +1,216 @@
+<!--
+  Repo Skill — Repository Access Admin Panel
+  Self-contained Alpine.js component. Loaded into a modal by the profiles page.
+  Calls: /api/repo/repos (GET, POST), /api/repo/repos/{id} (PUT, DELETE)
+-->
+<div x-data="repoAdmin()" x-init="init()" class="flex flex-col h-full" style="min-height: 400px;">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-4">
+        <div>
+            <h3 class="text-lg font-semibold text-white">Repository Access</h3>
+            <span class="text-xs text-gray-400" x-text="`${repos.length} repositories configured`"></span>
+        </div>
+        <button @click="showAdd = !showAdd"
+            class="px-3 py-1.5 text-xs font-medium rounded-lg transition-colors"
+            :class="showAdd ? 'bg-gray-700 text-gray-300' : 'bg-orange-600 hover:bg-orange-500 text-white'">
+            <span x-text="showAdd ? 'Cancel' : '+ Add Repo'"></span>
+        </button>
+    </div>
+
+    <!-- Add Form -->
+    <div x-show="showAdd" x-cloak class="mb-4 p-4 bg-gray-900/50 border border-gray-700 rounded-lg">
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div>
+                <label class="block text-xs text-gray-400 mb-1">Repository (owner/repo)</label>
+                <input x-model="newRepo.repo" type="text" placeholder="aglickman/my-project"
+                    class="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded text-sm text-white placeholder-gray-500 focus:border-orange-500 focus:outline-none" />
+            </div>
+            <div>
+                <label class="block text-xs text-gray-400 mb-1">Label (optional)</label>
+                <input x-model="newRepo.label" type="text" placeholder="My Project"
+                    class="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded text-sm text-white placeholder-gray-500 focus:border-orange-500 focus:outline-none" />
+            </div>
+            <div>
+                <label class="block text-xs text-gray-400 mb-1">Access Level</label>
+                <select x-model="newRepo.access"
+                    class="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded text-sm text-white focus:border-orange-500 focus:outline-none">
+                    <option value="full">Full (clone, read, write, push, PR)</option>
+                    <option value="read-only">Read Only (clone, read, grep)</option>
+                    <option value="no-push">No Push (clone, read, write, commit)</option>
+                </select>
+            </div>
+        </div>
+        <div class="mt-3 flex justify-end">
+            <button @click="addRepo()"
+                class="px-4 py-2 text-xs font-medium bg-orange-600 hover:bg-orange-500 text-white rounded-lg transition-colors"
+                :disabled="!newRepo.repo || saving">
+                <span x-text="saving ? 'Adding...' : 'Add Repository'"></span>
+            </button>
+        </div>
+        <div x-show="addError" class="mt-2 text-xs text-red-400" x-text="addError"></div>
+    </div>
+
+    <!-- Repo List -->
+    <div class="flex-1 overflow-y-auto">
+        <div x-show="loading" class="text-center text-gray-500 py-8">
+            <span class="animate-pulse">Loading repositories...</span>
+        </div>
+
+        <div x-show="!loading && repos.length === 0" class="text-center text-gray-500 py-8">
+            No repositories configured. Add one to get started.
+        </div>
+
+        <div x-show="!loading && repos.length > 0" class="space-y-2">
+            <template x-for="repo in repos" :key="repo.id">
+                <div class="flex items-center gap-3 p-3 bg-gray-900/30 border border-gray-700/50 rounded-lg hover:border-gray-600 transition-colors"
+                    :class="{ 'opacity-50': !repo.enabled }">
+
+                    <!-- Repo icon -->
+                    <div class="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold"
+                        :class="{
+                            'bg-green-900/50 text-green-400 ring-1 ring-green-500/30': repo.access === 'full' && repo.enabled,
+                            'bg-blue-900/50 text-blue-400 ring-1 ring-blue-500/30': repo.access === 'read-only' && repo.enabled,
+                            'bg-yellow-900/50 text-yellow-400 ring-1 ring-yellow-500/30': repo.access === 'no-push' && repo.enabled,
+                            'bg-gray-800 text-gray-500 ring-1 ring-gray-600/30': !repo.enabled,
+                        }">
+                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12.75V12A2.25 2.25 0 0 1 4.5 9.75h15A2.25 2.25 0 0 1 21.75 12v.75m-8.69-6.44-2.12-2.12a1.5 1.5 0 0 0-1.061-.44H4.5A2.25 2.25 0 0 0 2.25 6v12a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9a2.25 2.25 0 0 0-2.25-2.25h-5.379a1.5 1.5 0 0 1-1.06-.44Z" />
+                        </svg>
+                    </div>
+
+                    <!-- Info -->
+                    <div class="flex-1 min-w-0">
+                        <div class="flex items-center gap-2">
+                            <span class="text-sm font-mono text-white truncate" x-text="repo.repo"></span>
+                            <span x-show="repo.label" class="text-xs text-gray-500" x-text="repo.label ? `(${repo.label})` : ''"></span>
+                        </div>
+                    </div>
+
+                    <!-- Access badge -->
+                    <select :value="repo.access" @change="updateAccess(repo, $event.target.value)"
+                        class="px-2 py-1 text-xs rounded bg-gray-800 border border-gray-600 text-gray-300 focus:outline-none focus:border-orange-500 cursor-pointer">
+                        <option value="full">Full</option>
+                        <option value="read-only">Read Only</option>
+                        <option value="no-push">No Push</option>
+                    </select>
+
+                    <!-- Enable/Disable toggle -->
+                    <button @click="toggleEnabled(repo)"
+                        class="px-2 py-1 text-xs rounded transition-colors"
+                        :class="repo.enabled ? 'bg-green-900/30 text-green-400 hover:bg-green-900/50' : 'bg-gray-800 text-gray-500 hover:bg-gray-700'">
+                        <span x-text="repo.enabled ? 'ON' : 'OFF'"></span>
+                    </button>
+
+                    <!-- Delete -->
+                    <button @click="deleteRepo(repo)" class="p-1 text-gray-500 hover:text-red-400 transition-colors">
+                        <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" />
+                        </svg>
+                    </button>
+                </div>
+            </template>
+        </div>
+    </div>
+
+    <!-- Access Legend -->
+    <div class="mt-4 pt-3 border-t border-gray-700/50">
+        <div class="flex gap-4 text-[10px] text-gray-500">
+            <span><span class="text-green-400">Full</span> — clone, read, write, commit, push, PR</span>
+            <span><span class="text-yellow-400">No Push</span> — clone, read, write, commit (no push/PR)</span>
+            <span><span class="text-blue-400">Read Only</span> — clone, read, grep, list only</span>
+        </div>
+    </div>
+</div>
+
+<script>
+function repoAdmin() {
+    return {
+        repos: [],
+        loading: true,
+        showAdd: false,
+        saving: false,
+        addError: null,
+        newRepo: { repo: '', label: '', access: 'full' },
+        skillName: 'repo',
+
+        async init() {
+            await this.loadRepos();
+        },
+
+        async loadRepos() {
+            this.loading = true;
+            try {
+                const resp = await fetch(`/api/${this.skillName}/repos`);
+                const data = await resp.json();
+                this.repos = data.repos || [];
+            } catch (e) {
+                console.error('Failed to load repos:', e);
+            }
+            this.loading = false;
+        },
+
+        async addRepo() {
+            if (!this.newRepo.repo) return;
+            this.saving = true;
+            this.addError = null;
+            try {
+                const resp = await fetch(`/api/${this.skillName}/repos`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(this.newRepo),
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    this.addError = data.detail || 'Failed to add repository';
+                } else {
+                    this.newRepo = { repo: '', label: '', access: 'full' };
+                    this.showAdd = false;
+                    await this.loadRepos();
+                }
+            } catch (e) {
+                this.addError = 'Network error';
+            }
+            this.saving = false;
+        },
+
+        async updateAccess(repo, access) {
+            try {
+                await fetch(`/api/${this.skillName}/repos/${repo.id}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ access }),
+                });
+                repo.access = access;
+            } catch (e) {
+                console.error('Failed to update:', e);
+            }
+        },
+
+        async toggleEnabled(repo) {
+            try {
+                await fetch(`/api/${this.skillName}/repos/${repo.id}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: !repo.enabled }),
+                });
+                repo.enabled = !repo.enabled;
+            } catch (e) {
+                console.error('Failed to toggle:', e);
+            }
+        },
+
+        async deleteRepo(repo) {
+            if (!confirm(`Remove ${repo.repo} from allowed repositories?`)) return;
+            try {
+                await fetch(`/api/${this.skillName}/repos/${repo.id}`, {
+                    method: 'DELETE',
+                });
+                await this.loadRepos();
+            } catch (e) {
+                console.error('Failed to delete:', e);
+            }
+        },
+    };
+}
+</script>

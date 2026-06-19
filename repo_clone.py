@@ -7,7 +7,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import WORKSPACE_ROOT, resolve_repo_path, sanitize_stderr
+from .base import WORKSPACE_ROOT, check_repo_access, sanitize_stderr
 
 
 @register_tool
@@ -43,17 +43,11 @@ class RepoCloneTool(BaseTool):
             "required": ["repo"],
         }
 
-    @property
-    def requires_grant_metadata(self) -> list[str]:
-        return ["allowed_repos"]
-
     def credential_keys(self) -> list[str]:
         return ["GITHUB_TOKEN"]
 
     async def execute(self, repo: str, branch: str = None, **kwargs) -> ToolResult:
-        allowed_repos = self.get_grant_metadata("allowed_repos")
-
-        valid, workspace_path, error = resolve_repo_path(repo, allowed_repos)
+        valid, workspace_path, access, error = await check_repo_access(repo, "clone")
         if not valid:
             return ToolResult.fail(error)
 
@@ -74,7 +68,6 @@ class RepoCloneTool(BaseTool):
     async def _clone_fresh(
         self, clone_url: str, workspace_path: str, repo: str, branch: str = None
     ) -> ToolResult:
-        """Clone a new repository."""
         os.makedirs(os.path.dirname(workspace_path), exist_ok=True)
 
         cmd = ["git", "clone", "--depth", "50", clone_url, workspace_path]
@@ -97,7 +90,6 @@ class RepoCloneTool(BaseTool):
                 return ToolResult.fail(f"Repository '{repo}' not found")
             return ToolResult.fail(f"Clone error: {sanitize_stderr(result.stderr)}")
 
-        # Configure git and strip token from remote
         self._configure_git(workspace_path)
         self._sanitize_remote(workspace_path, repo)
 
@@ -113,7 +105,6 @@ class RepoCloneTool(BaseTool):
     async def _update_existing(
         self, workspace_path: str, repo: str, branch: str = None, token: str = None
     ) -> ToolResult:
-        """Update an already-cloned repo."""
         # Verify remote points to the expected repo
         remote_result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
@@ -141,7 +132,6 @@ class RepoCloneTool(BaseTool):
                 timeout=10,
             )
 
-        # Checkout requested branch if specified
         if branch:
             subprocess.run(
                 ["git", "checkout", branch],
@@ -151,7 +141,6 @@ class RepoCloneTool(BaseTool):
                 timeout=30,
             )
 
-        # Fetch + pull
         subprocess.run(
             ["git", "fetch", "origin"],
             cwd=workspace_path,
@@ -169,7 +158,6 @@ class RepoCloneTool(BaseTool):
             timeout=60,
         )
 
-        # Strip token from remote URL after fetch
         self._configure_git(workspace_path)
         self._sanitize_remote(workspace_path, repo)
 
@@ -186,50 +174,34 @@ class RepoCloneTool(BaseTool):
         })
 
     def _configure_git(self, workspace_path: str):
-        """Set git user config for the workspace."""
         subprocess.run(
             ["git", "config", "user.email", "bot@instar.local"],
-            cwd=workspace_path,
-            capture_output=True,
-            timeout=5,
+            cwd=workspace_path, capture_output=True, timeout=5,
         )
         subprocess.run(
             ["git", "config", "user.name", "Instar Bot"],
-            cwd=workspace_path,
-            capture_output=True,
-            timeout=5,
+            cwd=workspace_path, capture_output=True, timeout=5,
         )
 
     def _sanitize_remote(self, workspace_path: str, repo: str):
-        """Replace token-embedded remote URL with clean HTTPS URL."""
         clean_url = f"https://github.com/{repo}.git"
         subprocess.run(
             ["git", "remote", "set-url", "origin", clean_url],
-            cwd=workspace_path,
-            capture_output=True,
-            text=True,
-            timeout=5,
+            cwd=workspace_path, capture_output=True, text=True, timeout=5,
         )
 
     def _get_repo_info(self, workspace_path: str) -> dict:
-        """Get current branch and HEAD info."""
         info = {}
         branch_result = subprocess.run(
             ["git", "branch", "--show-current"],
-            cwd=workspace_path,
-            capture_output=True,
-            text=True,
-            timeout=5,
+            cwd=workspace_path, capture_output=True, text=True, timeout=5,
         )
         if branch_result.returncode == 0:
             info["branch"] = branch_result.stdout.strip()
 
         head_result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=workspace_path,
-            capture_output=True,
-            text=True,
-            timeout=5,
+            cwd=workspace_path, capture_output=True, text=True, timeout=5,
         )
         if head_result.returncode == 0:
             info["head"] = head_result.stdout.strip()

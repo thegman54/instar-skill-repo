@@ -8,7 +8,7 @@ import httpx
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import resolve_repo_path, validate_project_root, validate_project_root
+from .base import check_repo_access, validate_project_root
 
 
 @register_tool
@@ -21,63 +21,31 @@ class RepoPRTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
-            "Create a pull request on GitHub. "
-            "Commits must be pushed first."
-        )
+        return "Create a pull request on GitHub. Commits must be pushed first."
 
     @property
     def input_schema(self) -> dict:
         return {
             "type": "object",
             "properties": {
-                "repo": {
-                    "type": "string",
-                    "description": "Repository in owner/repo format",
-                },
-                "title": {
-                    "type": "string",
-                    "description": "PR title",
-                },
-                "body": {
-                    "type": "string",
-                    "description": "PR description/body",
-                },
-                "head": {
-                    "type": "string",
-                    "description": "Branch containing changes (default: current branch)",
-                },
-                "base": {
-                    "type": "string",
-                    "description": "Base branch to merge into (default: main)",
-                },
-                "draft": {
-                    "type": "boolean",
-                    "description": "Create as draft PR (default: false)",
-                },
+                "repo": {"type": "string", "description": "Repository in owner/repo format"},
+                "title": {"type": "string", "description": "PR title"},
+                "body": {"type": "string", "description": "PR description/body"},
+                "head": {"type": "string", "description": "Branch containing changes (default: current branch)"},
+                "base": {"type": "string", "description": "Base branch to merge into (default: main)"},
+                "draft": {"type": "boolean", "description": "Create as draft PR (default: false)"},
             },
             "required": ["repo", "title", "body"],
         }
-
-    @property
-    def requires_grant_metadata(self) -> list[str]:
-        return ["allowed_repos"]
 
     def credential_keys(self) -> list[str]:
         return ["GITHUB_TOKEN"]
 
     async def execute(
-        self,
-        repo: str,
-        title: str,
-        body: str,
-        head: str = None,
-        base: str = "main",
-        draft: bool = False,
-        **kwargs
+        self, repo: str, title: str, body: str,
+        head: str = None, base: str = "main", draft: bool = False, **kwargs
     ) -> ToolResult:
-        allowed_repos = self.get_grant_metadata("allowed_repos")
-        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+        valid, project_root, access, error = await check_repo_access(repo, "pr")
         if not valid:
             return ToolResult.fail(error)
 
@@ -87,14 +55,10 @@ class RepoPRTool(BaseTool):
 
         token = self.get_credential("GITHUB_TOKEN")
 
-        # Get current branch if head not specified
         if not head:
             branch_result = subprocess.run(
                 ["git", "branch", "--show-current"],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=10,
+                cwd=project_root, capture_output=True, text=True, timeout=10,
             )
             if branch_result.returncode != 0:
                 return ToolResult.fail("Could not determine current branch for PR head")
@@ -112,26 +76,15 @@ class RepoPRTool(BaseTool):
                         "Accept": "application/vnd.github+json",
                         "X-GitHub-Api-Version": "2022-11-28",
                     },
-                    json={
-                        "title": title,
-                        "body": body,
-                        "head": head,
-                        "base": base,
-                        "draft": draft,
-                    },
+                    json={"title": title, "body": body, "head": head, "base": base, "draft": draft},
                 )
 
                 if resp.status_code == 201:
                     data = resp.json()
                     return ToolResult.ok({
-                        "url": data["html_url"],
-                        "number": data["number"],
-                        "title": title,
-                        "head": head,
-                        "base": base,
-                        "draft": draft,
+                        "url": data["html_url"], "number": data["number"],
+                        "title": title, "head": head, "base": base, "draft": draft,
                     })
-
                 if resp.status_code == 422:
                     data = resp.json()
                     errors = data.get("errors", [])
@@ -139,13 +92,10 @@ class RepoPRTool(BaseTool):
                     if any("pull request already exists" in m for m in messages):
                         return ToolResult.fail("A PR already exists for this branch")
                     return ToolResult.fail(f"GitHub validation error: {data.get('message', '')} — {messages}")
-
                 if resp.status_code in (401, 403):
                     return ToolResult.fail("GitHub authentication failed — check GITHUB_TOKEN permissions")
-
                 if resp.status_code == 404:
                     return ToolResult.fail(f"Repository '{repo}' not found or token lacks access")
-
                 return ToolResult.fail(f"GitHub API error {resp.status_code}: {resp.text[:500]}")
 
         except httpx.TimeoutException:
