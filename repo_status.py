@@ -1,18 +1,17 @@
 """
-Repo Status Tool - Show git status.
+Repo Status Tool - Show git working tree status.
 """
 
 import subprocess
-from pathlib import Path
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import validate_project_root
+from .base import resolve_repo_path, validate_project_root
 
 
 @register_tool
 class RepoStatusTool(BaseTool):
-    """Show git status of the repository."""
+    """Show git working tree status."""
 
     @property
     def name(self) -> str:
@@ -20,67 +19,74 @@ class RepoStatusTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Show the git status of the current repository (modified, staged, untracked files)."
+        return "Show the git status of the repository — staged, modified, and untracked files."
 
     @property
     def input_schema(self) -> dict:
         return {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository in owner/repo format",
+                },
+            },
+            "required": ["repo"],
         }
 
     @property
     def requires_grant_metadata(self) -> list[str]:
-        return ["project_root"]
+        return ["allowed_repos"]
 
     def credential_keys(self) -> list[str]:
         return []
 
-    async def execute(self, **kwargs) -> ToolResult:
-        project_root = self.get_grant_metadata("project_root")
+    async def execute(self, repo: str, **kwargs) -> ToolResult:
+        allowed_repos = self.get_grant_metadata("allowed_repos")
+        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+        if not valid:
+            return ToolResult.fail(error)
 
         valid, error = validate_project_root(project_root)
         if not valid:
             return ToolResult.fail(error)
 
         try:
-            # Get status with porcelain format for parsing
             result = subprocess.run(
-                ["git", "status", "--porcelain", "-u"],
+                ["git", "status", "--porcelain"],
                 cwd=project_root,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=15,
             )
 
             if result.returncode != 0:
                 return ToolResult.fail(f"Git error: {result.stderr}")
 
-            # Parse status
             staged = []
             modified = []
             untracked = []
 
             for line in result.stdout.strip().split('\n'):
-                if not line:
+                if not line.strip():
                     continue
-                status = line[:2]
+                index_status = line[0]
+                work_status = line[1]
                 filepath = line[3:]
 
-                if status[0] in 'MADRC':  # Staged
+                if index_status in ('A', 'M', 'D', 'R', 'C'):
                     staged.append(filepath)
-                if status[1] in 'MD':  # Modified in working tree
+                if work_status == 'M':
                     modified.append(filepath)
-                if status == '??':  # Untracked
+                if index_status == '?' and work_status == '?':
                     untracked.append(filepath)
 
-            # Get current branch
             branch_result = subprocess.run(
                 ["git", "branch", "--show-current"],
                 cwd=project_root,
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=5,
             )
             branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "unknown"
 
@@ -88,8 +94,8 @@ class RepoStatusTool(BaseTool):
                 "branch": branch,
                 "staged": staged,
                 "modified": modified,
-                "untracked": untracked[:50],  # Limit untracked
-                "clean": len(staged) == 0 and len(modified) == 0 and len(untracked) == 0,
+                "untracked": untracked,
+                "clean": not staged and not modified and not untracked,
             })
 
         except subprocess.TimeoutExpired:

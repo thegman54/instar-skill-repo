@@ -1,17 +1,17 @@
 """
-Repo Actions Tool - Check GitHub Actions CI status.
+Repo Actions Tool - Check GitHub Actions CI status via REST API.
 """
 
-import subprocess
+import httpx
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import validate_project_root
+from .base import resolve_repo_path
 
 
 @register_tool
 class RepoActionsTool(BaseTool):
-    """Check GitHub Actions workflow status."""
+    """Check GitHub Actions workflow status via REST API."""
 
     @property
     def name(self) -> str:
@@ -21,7 +21,7 @@ class RepoActionsTool(BaseTool):
     def description(self) -> str:
         return (
             "Check GitHub Actions CI/CD status. "
-            "Lists recent workflow runs and their status (success, failure, in_progress)."
+            "Lists recent workflow runs and their status."
         )
 
     @property
@@ -29,6 +29,10 @@ class RepoActionsTool(BaseTool):
         return {
             "type": "object",
             "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository in owner/repo format",
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Number of runs to show (default: 10)",
@@ -37,115 +41,146 @@ class RepoActionsTool(BaseTool):
                     "type": "string",
                     "description": "Filter by branch name",
                 },
-                "workflow": {
+                "status": {
                     "type": "string",
-                    "description": "Filter by workflow name or filename",
+                    "enum": ["completed", "in_progress", "queued"],
+                    "description": "Filter by run status",
                 },
                 "run_id": {
-                    "type": "string",
+                    "type": "integer",
                     "description": "Get details for a specific run ID",
                 },
             },
+            "required": ["repo"],
         }
 
     @property
     def requires_grant_metadata(self) -> list[str]:
-        return ["project_root"]
+        return ["allowed_repos"]
 
     def credential_keys(self) -> list[str]:
-        return []
+        return ["GITHUB_TOKEN"]
 
     async def execute(
         self,
+        repo: str,
         limit: int = 10,
         branch: str = None,
-        workflow: str = None,
-        run_id: str = None,
+        status: str = None,
+        run_id: int = None,
         **kwargs
     ) -> ToolResult:
-        project_root = self.get_grant_metadata("project_root")
-
-        valid, error = validate_project_root(project_root)
+        allowed_repos = self.get_grant_metadata("allowed_repos")
+        valid, _, error = resolve_repo_path(repo, allowed_repos)
         if not valid:
             return ToolResult.fail(error)
 
-        try:
-            if run_id:
-                return await self._get_run_details(project_root, run_id)
-            else:
-                return await self._list_runs(project_root, limit, branch, workflow)
+        token = self.get_credential("GITHUB_TOKEN")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
 
-        except FileNotFoundError:
-            return ToolResult.fail("GitHub CLI (gh) not installed")
-        except subprocess.TimeoutExpired:
-            return ToolResult.fail("Command timed out")
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                if run_id:
+                    return await self._get_run_details(client, repo, run_id, headers)
+                else:
+                    return await self._list_runs(client, repo, limit, branch, status, headers)
+
+        except httpx.TimeoutException:
+            return ToolResult.fail("GitHub API request timed out")
         except Exception as e:
             return ToolResult.fail(f"Actions error: {str(e)}")
 
     async def _list_runs(
-        self,
-        project_root: str,
-        limit: int,
-        branch: str = None,
-        workflow: str = None
+        self, client, repo, limit, branch, status, headers
     ) -> ToolResult:
-        """List recent workflow runs."""
-        cmd = ["gh", "run", "list", f"--limit={limit}"]
-
+        params = {"per_page": min(limit, 100)}
         if branch:
-            cmd.extend(["--branch", branch])
-        if workflow:
-            cmd.extend(["--workflow", workflow])
+            params["branch"] = branch
+        if status:
+            params["status"] = status
 
-        result = subprocess.run(
-            cmd,
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            timeout=30,
+        resp = await client.get(
+            f"https://api.github.com/repos/{repo}/actions/runs",
+            headers=headers,
+            params=params,
         )
 
-        if result.returncode != 0:
-            stderr = result.stderr.lower()
-            if "not a git repository" in stderr:
-                return ToolResult.fail("Not a git repository")
-            if "could not find" in stderr or "no runs found" in stderr:
-                return ToolResult.ok({
-                    "runs": [],
-                    "message": "No workflow runs found",
-                })
-            return ToolResult.fail(f"gh error: {result.stderr}")
+        if resp.status_code in (401, 403):
+            return ToolResult.fail("GitHub authentication failed — check GITHUB_TOKEN")
+        if resp.status_code == 404:
+            return ToolResult.fail(f"Repository '{repo}' not found")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"GitHub API error {resp.status_code}: {resp.text[:300]}")
 
-        output = result.stdout.strip()
+        data = resp.json()
+        runs = data.get("workflow_runs", [])
 
-        if not output:
+        if not runs:
             return ToolResult.ok({
                 "runs": [],
                 "message": "No workflow runs found",
             })
 
+        formatted = []
+        for run in runs:
+            formatted.append({
+                "id": run["id"],
+                "name": run.get("name", ""),
+                "status": run["status"],
+                "conclusion": run.get("conclusion"),
+                "branch": run["head_branch"],
+                "event": run["event"],
+                "created_at": run["created_at"],
+                "url": run["html_url"],
+            })
+
         return ToolResult.ok({
-            "count": len(output.split('\n')),
-            "runs": output,
+            "count": len(formatted),
+            "runs": formatted,
         })
 
-    async def _get_run_details(self, project_root: str, run_id: str) -> ToolResult:
-        """Get details for a specific run."""
-        result = subprocess.run(
-            ["gh", "run", "view", run_id],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            timeout=30,
+    async def _get_run_details(self, client, repo, run_id, headers) -> ToolResult:
+        resp = await client.get(
+            f"https://api.github.com/repos/{repo}/actions/runs/{run_id}",
+            headers=headers,
         )
 
-        if result.returncode != 0:
-            stderr = result.stderr.lower()
-            if "not found" in stderr:
-                return ToolResult.fail(f"Run {run_id} not found")
-            return ToolResult.fail(f"gh error: {result.stderr}")
+        if resp.status_code == 404:
+            return ToolResult.fail(f"Run {run_id} not found")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"GitHub API error {resp.status_code}")
+
+        run = resp.json()
+
+        # Also get jobs
+        jobs_resp = await client.get(
+            f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs",
+            headers=headers,
+        )
+
+        jobs = []
+        if jobs_resp.status_code == 200:
+            for job in jobs_resp.json().get("jobs", []):
+                jobs.append({
+                    "name": job["name"],
+                    "status": job["status"],
+                    "conclusion": job.get("conclusion"),
+                    "started_at": job.get("started_at"),
+                    "completed_at": job.get("completed_at"),
+                })
 
         return ToolResult.ok({
             "run_id": run_id,
-            "details": result.stdout.strip(),
+            "name": run.get("name", ""),
+            "status": run["status"],
+            "conclusion": run.get("conclusion"),
+            "branch": run["head_branch"],
+            "event": run["event"],
+            "created_at": run["created_at"],
+            "url": run["html_url"],
+            "jobs": jobs,
         })

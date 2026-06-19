@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import validate_path
+from .base import resolve_repo_path, validate_path, validate_project_root
 
 
 @register_tool
@@ -19,13 +19,17 @@ class RepoReadTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Read the contents of a file in the current repository."
+        return "Read the contents of a file in the repository."
 
     @property
     def input_schema(self) -> dict:
         return {
             "type": "object",
             "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository in owner/repo format",
+                },
                 "path": {
                     "type": "string",
                     "description": "File path relative to repository root",
@@ -39,26 +43,33 @@ class RepoReadTool(BaseTool):
                     "description": "Stop reading at this line (inclusive, optional)",
                 },
             },
-            "required": ["path"],
+            "required": ["repo", "path"],
         }
 
     @property
     def requires_grant_metadata(self) -> list[str]:
-        return ["project_root"]
+        return ["allowed_repos"]
 
     def credential_keys(self) -> list[str]:
         return []
 
     async def execute(
         self,
+        repo: str,
         path: str,
         start_line: int = None,
         end_line: int = None,
         **kwargs
     ) -> ToolResult:
-        project_root = self.get_grant_metadata("project_root")
+        allowed_repos = self.get_grant_metadata("allowed_repos")
+        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+        if not valid:
+            return ToolResult.fail(error)
 
-        # Validate path is within project
+        valid, error = validate_project_root(project_root)
+        if not valid:
+            return ToolResult.fail(error)
+
         valid, abs_path, error = validate_path(project_root, path)
         if not valid:
             return ToolResult.fail(error)
@@ -76,14 +87,12 @@ class RepoReadTool(BaseTool):
             lines = content.splitlines(keepends=True)
             total_lines = len(lines)
 
-            # Apply line range if specified
             if start_line is not None or end_line is not None:
-                start = (start_line or 1) - 1  # Convert to 0-indexed
+                start = (start_line or 1) - 1
                 end = end_line or total_lines
                 lines = lines[start:end]
                 content = ''.join(lines)
 
-            # Truncate very large files
             max_chars = 100000
             truncated = len(content) > max_chars
             if truncated:

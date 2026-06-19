@@ -1,18 +1,18 @@
 """
-Repo List Tool - List files in the repository.
+Repo List Tool - List files and directories in the repository.
 """
 
-import glob
+import fnmatch
 from pathlib import Path
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import validate_path, validate_project_root
+from .base import resolve_repo_path, validate_path, validate_project_root
 
 
 @register_tool
 class RepoListTool(BaseTool):
-    """List files in the repository."""
+    """List files and directories in the repository."""
 
     @property
     def name(self) -> str:
@@ -21,8 +21,8 @@ class RepoListTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "List files in the current repository. "
-            "Supports glob patterns like '**/*.py' or 'src/**/*'."
+            "List files and directories in the repository. "
+            "Supports glob patterns and recursive listing."
         )
 
     @property
@@ -30,70 +30,97 @@ class RepoListTool(BaseTool):
         return {
             "type": "object",
             "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository in owner/repo format",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Directory path relative to repo root (default: root)",
+                },
                 "pattern": {
                     "type": "string",
-                    "description": "Glob pattern (default: '*' for top-level files)",
+                    "description": "Glob pattern to filter files (e.g. '*.py', '**/*.ts')",
                 },
-                "include_hidden": {
+                "recursive": {
                     "type": "boolean",
-                    "description": "Include hidden files/dirs (default: false)",
+                    "description": "List recursively (default: false)",
                 },
             },
+            "required": ["repo"],
         }
 
     @property
     def requires_grant_metadata(self) -> list[str]:
-        return ["project_root"]
+        return ["allowed_repos"]
 
     def credential_keys(self) -> list[str]:
-        return []  # No credentials needed
+        return []
 
     async def execute(
         self,
-        pattern: str = "*",
-        include_hidden: bool = False,
+        repo: str,
+        path: str = ".",
+        pattern: str = None,
+        recursive: bool = False,
         **kwargs
     ) -> ToolResult:
-        # Get project root from grant metadata
-        project_root = self.get_grant_metadata("project_root")
+        allowed_repos = self.get_grant_metadata("allowed_repos")
+        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+        if not valid:
+            return ToolResult.fail(error)
 
         valid, error = validate_project_root(project_root)
         if not valid:
             return ToolResult.fail(error)
 
-        root = Path(project_root)
+        valid, abs_path, error = validate_path(project_root, path)
+        if not valid:
+            return ToolResult.fail(error)
 
-        # Run glob from project root
+        target = Path(abs_path)
+
+        if not target.exists():
+            return ToolResult.fail(f"Directory not found: {path}")
+
+        if not target.is_dir():
+            return ToolResult.fail(f"Not a directory: {path}")
+
         try:
-            if "**" in pattern:
-                matches = list(root.glob(pattern))
-            else:
-                matches = list(root.glob(pattern))
-
-            # Filter hidden files if not requested
-            if not include_hidden:
-                matches = [
-                    m for m in matches
-                    if not any(part.startswith('.') for part in m.parts[len(root.parts):])
-                ]
-
-            # Convert to relative paths
             files = []
             dirs = []
-            for match in sorted(matches):
-                rel_path = str(match.relative_to(root))
-                if match.is_dir():
-                    dirs.append(rel_path + "/")
-                else:
-                    files.append(rel_path)
+            max_files = 500
+            max_dirs = 100
+
+            if pattern and recursive:
+                for item in sorted(target.rglob(pattern)):
+                    if item.name.startswith('.'):
+                        continue
+                    rel = str(item.relative_to(Path(project_root)))
+                    if item.is_file() and len(files) < max_files:
+                        files.append(rel)
+                    elif item.is_dir() and len(dirs) < max_dirs:
+                        dirs.append(rel + "/")
+            else:
+                iterator = target.rglob("*") if recursive else target.iterdir()
+                for item in sorted(iterator):
+                    if item.name.startswith('.'):
+                        continue
+                    rel = str(item.relative_to(Path(project_root)))
+                    if pattern and not fnmatch.fnmatch(item.name, pattern):
+                        continue
+                    if item.is_file() and len(files) < max_files:
+                        files.append(rel)
+                    elif item.is_dir() and len(dirs) < max_dirs:
+                        dirs.append(rel + "/")
 
             return ToolResult.ok({
-                "pattern": pattern,
-                "directories": dirs[:100],  # Limit output
-                "files": files[:500],
-                "total_dirs": len(dirs),
-                "total_files": len(files),
-                "truncated": len(files) > 500 or len(dirs) > 100,
+                "path": path,
+                "files": files,
+                "directories": dirs,
+                "file_count": len(files),
+                "dir_count": len(dirs),
+                "truncated": len(files) >= max_files or len(dirs) >= max_dirs,
             })
 
         except Exception as e:

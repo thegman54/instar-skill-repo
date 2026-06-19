@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import validate_project_root
+from .base import resolve_repo_path, validate_project_root
 
 
 @register_tool
@@ -26,6 +26,10 @@ class RepoLogTool(BaseTool):
         return {
             "type": "object",
             "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository in owner/repo format",
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Number of commits to show (default: 20)",
@@ -43,24 +47,29 @@ class RepoLogTool(BaseTool):
                     "description": "Show commits affecting this file/directory only",
                 },
             },
+            "required": ["repo"],
         }
 
     @property
     def requires_grant_metadata(self) -> list[str]:
-        return ["project_root"]
+        return ["allowed_repos"]
 
     def credential_keys(self) -> list[str]:
         return []
 
     async def execute(
         self,
+        repo: str,
         limit: int = 20,
         branch: str = None,
         oneline: bool = False,
         path: str = None,
         **kwargs
     ) -> ToolResult:
-        project_root = self.get_grant_metadata("project_root")
+        allowed_repos = self.get_grant_metadata("allowed_repos")
+        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+        if not valid:
+            return ToolResult.fail(error)
 
         valid, error = validate_project_root(project_root)
         if not valid:
@@ -72,7 +81,6 @@ class RepoLogTool(BaseTool):
             if oneline:
                 cmd.append("--oneline")
             else:
-                # Readable format: hash, author, date, message
                 cmd.extend(["--format=%h | %an | %ar | %s"])
 
             if branch:

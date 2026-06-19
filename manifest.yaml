@@ -1,14 +1,15 @@
 name: repo
 display_name: Repository
-description: Read, write, commit, push, and manage git repositories
+description: Clone, read, write, search, commit, push, and manage git repositories
 category: Repository
 icon: folder
 color: orange
-version: 1.0.0
+version: 2.0.0
 
-# No credentials — uses grant metadata for project scoping
-credentials: []
+credentials:
+  - key: GITHUB_TOKEN
+    description: GitHub Personal Access Token for clone/push operations
 
 grant_metadata:
-  - key: project_root
-    description: Filesystem path to the git repository
+  - key: allowed_repos
+    description: Comma-separated list of allowed GitHub repos (e.g. "owner/repo1,owner/repo2") or "*" for any

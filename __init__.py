@@ -1,13 +1,15 @@
 """
-Repo Tools - Controlled access to code repositories.
+Repo Tools - Clone, read, write, search, commit, push, and manage git repositories.
 
-Each tool validates paths against the grant's project_root.
-Bot never sees file paths outside the allowed project.
+All tools validate repo access against the grant's allowed_repos list.
+Repos are cloned into /projects/workspace/<owner>/<repo>/.
 """
 
+from .repo_clone import RepoCloneTool
 from .repo_list import RepoListTool
 from .repo_read import RepoReadTool
 from .repo_write import RepoWriteTool
+from .repo_grep import RepoGrepTool
 from .repo_status import RepoStatusTool
 from .repo_diff import RepoDiffTool
 from .repo_commit import RepoCommitTool
@@ -18,9 +20,11 @@ from .repo_branch import RepoBranchTool
 from .repo_actions import RepoActionsTool
 
 __all__ = [
+    'RepoCloneTool',
     'RepoListTool',
     'RepoReadTool',
     'RepoWriteTool',
+    'RepoGrepTool',
     'RepoStatusTool',
     'RepoDiffTool',
     'RepoCommitTool',

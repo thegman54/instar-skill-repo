@@ -1,17 +1,19 @@
 """
-Repo PR Tool - Create a pull request.
+Repo PR Tool - Create a pull request via GitHub REST API.
 """
 
 import subprocess
 
+import httpx
+
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import validate_project_root
+from .base import resolve_repo_path, validate_project_root, validate_project_root
 
 
 @register_tool
 class RepoPRTool(BaseTool):
-    """Create a pull request on GitHub."""
+    """Create a pull request on GitHub via REST API."""
 
     @property
     def name(self) -> str:
@@ -20,8 +22,8 @@ class RepoPRTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Create a pull request on GitHub using the gh CLI. "
-            "Requires commits to be pushed first."
+            "Create a pull request on GitHub. "
+            "Commits must be pushed first."
         )
 
     @property
@@ -29,6 +31,10 @@ class RepoPRTool(BaseTool):
         return {
             "type": "object",
             "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository in owner/repo format",
+                },
                 "title": {
                     "type": "string",
                     "description": "PR title",
@@ -36,6 +42,10 @@ class RepoPRTool(BaseTool):
                 "body": {
                     "type": "string",
                     "description": "PR description/body",
+                },
+                "head": {
+                    "type": "string",
+                    "description": "Branch containing changes (default: current branch)",
                 },
                 "base": {
                     "type": "string",
@@ -46,72 +56,99 @@ class RepoPRTool(BaseTool):
                     "description": "Create as draft PR (default: false)",
                 },
             },
-            "required": ["title", "body"],
+            "required": ["repo", "title", "body"],
         }
 
     @property
     def requires_grant_metadata(self) -> list[str]:
-        return ["project_root"]
+        return ["allowed_repos"]
 
     def credential_keys(self) -> list[str]:
-        return []
+        return ["GITHUB_TOKEN"]
 
     async def execute(
         self,
+        repo: str,
         title: str,
         body: str,
+        head: str = None,
         base: str = "main",
         draft: bool = False,
         **kwargs
     ) -> ToolResult:
-        project_root = self.get_grant_metadata("project_root")
+        allowed_repos = self.get_grant_metadata("allowed_repos")
+        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+        if not valid:
+            return ToolResult.fail(error)
 
         valid, error = validate_project_root(project_root)
         if not valid:
             return ToolResult.fail(error)
 
-        try:
-            # Build PR command
-            cmd = [
-                "gh", "pr", "create",
-                "--title", title,
-                "--body", body,
-                "--base", base,
-            ]
+        token = self.get_credential("GITHUB_TOKEN")
 
-            if draft:
-                cmd.append("--draft")
-
-            result = subprocess.run(
-                cmd,
+        # Get current branch if head not specified
+        if not head:
+            branch_result = subprocess.run(
+                ["git", "branch", "--show-current"],
                 cwd=project_root,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=10,
             )
+            if branch_result.returncode != 0:
+                return ToolResult.fail("Could not determine current branch for PR head")
+            head = branch_result.stdout.strip()
 
-            if result.returncode != 0:
-                # Check for common errors
-                stderr = result.stderr.lower()
-                if "already exists" in stderr:
-                    return ToolResult.fail("A PR already exists for this branch")
-                if "not authenticated" in stderr or "gh auth" in stderr:
-                    return ToolResult.fail("GitHub CLI not authenticated")
-                return ToolResult.fail(f"PR error: {result.stderr}")
+        if head == base:
+            return ToolResult.fail(f"Head branch '{head}' is the same as base branch '{base}'")
 
-            # Parse the PR URL from output
-            pr_url = result.stdout.strip()
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"https://api.github.com/repos/{repo}/pulls",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                    json={
+                        "title": title,
+                        "body": body,
+                        "head": head,
+                        "base": base,
+                        "draft": draft,
+                    },
+                )
 
-            return ToolResult.ok({
-                "url": pr_url,
-                "title": title,
-                "base": base,
-                "draft": draft,
-            })
+                if resp.status_code == 201:
+                    data = resp.json()
+                    return ToolResult.ok({
+                        "url": data["html_url"],
+                        "number": data["number"],
+                        "title": title,
+                        "head": head,
+                        "base": base,
+                        "draft": draft,
+                    })
 
-        except FileNotFoundError:
-            return ToolResult.fail("GitHub CLI (gh) not installed")
-        except subprocess.TimeoutExpired:
-            return ToolResult.fail("PR creation timed out")
+                if resp.status_code == 422:
+                    data = resp.json()
+                    errors = data.get("errors", [])
+                    messages = [e.get("message", "") for e in errors]
+                    if any("pull request already exists" in m for m in messages):
+                        return ToolResult.fail("A PR already exists for this branch")
+                    return ToolResult.fail(f"GitHub validation error: {data.get('message', '')} — {messages}")
+
+                if resp.status_code in (401, 403):
+                    return ToolResult.fail("GitHub authentication failed — check GITHUB_TOKEN permissions")
+
+                if resp.status_code == 404:
+                    return ToolResult.fail(f"Repository '{repo}' not found or token lacks access")
+
+                return ToolResult.fail(f"GitHub API error {resp.status_code}: {resp.text[:500]}")
+
+        except httpx.TimeoutException:
+            return ToolResult.fail("GitHub API request timed out")
         except Exception as e:
-            return ToolResult.fail(f"PR error: {str(e)}")
+            return ToolResult.fail(f"PR creation error: {str(e)}")

@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import validate_project_root
+from .base import resolve_repo_path, validate_project_root
 
 
 @register_tool
@@ -29,6 +29,10 @@ class RepoBranchTool(BaseTool):
         return {
             "type": "object",
             "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository in owner/repo format",
+                },
                 "action": {
                     "type": "string",
                     "enum": ["list", "create", "switch"],
@@ -43,23 +47,28 @@ class RepoBranchTool(BaseTool):
                     "description": "Base branch to create from (default: current branch)",
                 },
             },
+            "required": ["repo"],
         }
 
     @property
     def requires_grant_metadata(self) -> list[str]:
-        return ["project_root"]
+        return ["allowed_repos"]
 
     def credential_keys(self) -> list[str]:
         return []
 
     async def execute(
         self,
+        repo: str,
         action: str = "list",
         name: str = None,
         from_branch: str = None,
         **kwargs
     ) -> ToolResult:
-        project_root = self.get_grant_metadata("project_root")
+        allowed_repos = self.get_grant_metadata("allowed_repos")
+        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+        if not valid:
+            return ToolResult.fail(error)
 
         valid, error = validate_project_root(project_root)
         if not valid:
@@ -85,7 +94,6 @@ class RepoBranchTool(BaseTool):
             return ToolResult.fail(f"Branch error: {str(e)}")
 
     async def _list_branches(self, project_root: str) -> ToolResult:
-        """List all branches with current branch marked."""
         result = subprocess.run(
             ["git", "branch", "-a", "-v"],
             cwd=project_root,
@@ -97,7 +105,6 @@ class RepoBranchTool(BaseTool):
         if result.returncode != 0:
             return ToolResult.fail(f"Git error: {result.stderr}")
 
-        # Get current branch
         current = subprocess.run(
             ["git", "branch", "--show-current"],
             cwd=project_root,
@@ -107,15 +114,12 @@ class RepoBranchTool(BaseTool):
         )
         current_branch = current.stdout.strip() if current.returncode == 0 else "unknown"
 
-        branches = result.stdout.strip()
-
         return ToolResult.ok({
             "current": current_branch,
-            "branches": branches,
+            "branches": result.stdout.strip(),
         })
 
     async def _create_branch(self, project_root: str, name: str, from_branch: str = None) -> ToolResult:
-        """Create a new branch."""
         cmd = ["git", "checkout", "-b", name]
         if from_branch:
             cmd.append(from_branch)
@@ -141,7 +145,6 @@ class RepoBranchTool(BaseTool):
         })
 
     async def _switch_branch(self, project_root: str, name: str) -> ToolResult:
-        """Switch to an existing branch."""
         result = subprocess.run(
             ["git", "checkout", name],
             cwd=project_root,

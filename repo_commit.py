@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import validate_path, validate_project_root
+from .base import resolve_repo_path, validate_path, validate_project_root
 
 
 @register_tool
@@ -21,7 +21,7 @@ class RepoCommitTool(BaseTool):
     def description(self) -> str:
         return (
             "Stage specified files and create a git commit. "
-            "Always specify which files to stage - never uses 'git add .'"
+            "Always specify which files to stage — never uses 'git add .'"
         )
 
     @property
@@ -29,6 +29,10 @@ class RepoCommitTool(BaseTool):
         return {
             "type": "object",
             "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository in owner/repo format",
+                },
                 "files": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -39,23 +43,27 @@ class RepoCommitTool(BaseTool):
                     "description": "Commit message",
                 },
             },
-            "required": ["files", "message"],
+            "required": ["repo", "files", "message"],
         }
 
     @property
     def requires_grant_metadata(self) -> list[str]:
-        return ["project_root"]
+        return ["allowed_repos"]
 
     def credential_keys(self) -> list[str]:
         return []
 
     async def execute(
         self,
+        repo: str,
         files: list[str],
         message: str,
         **kwargs
     ) -> ToolResult:
-        project_root = self.get_grant_metadata("project_root")
+        allowed_repos = self.get_grant_metadata("allowed_repos")
+        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+        if not valid:
+            return ToolResult.fail(error)
 
         valid, error = validate_project_root(project_root)
         if not valid:
@@ -76,7 +84,6 @@ class RepoCommitTool(BaseTool):
             validated_files.append(f)
 
         try:
-            # Stage files
             stage_result = subprocess.run(
                 ["git", "add", "--"] + validated_files,
                 cwd=project_root,
@@ -88,7 +95,6 @@ class RepoCommitTool(BaseTool):
             if stage_result.returncode != 0:
                 return ToolResult.fail(f"Stage error: {stage_result.stderr}")
 
-            # Commit with co-author tag
             full_message = f"{message}\n\nCo-Authored-By: Instar Bot <bot@instar.local>"
 
             commit_result = subprocess.run(
@@ -100,12 +106,10 @@ class RepoCommitTool(BaseTool):
             )
 
             if commit_result.returncode != 0:
-                # Check if nothing to commit
                 if "nothing to commit" in commit_result.stdout.lower():
-                    return ToolResult.fail("Nothing to commit - files may not have changes")
+                    return ToolResult.fail("Nothing to commit — files may not have changes")
                 return ToolResult.fail(f"Commit error: {commit_result.stderr}")
 
-            # Get the commit hash
             hash_result = subprocess.run(
                 ["git", "rev-parse", "--short", "HEAD"],
                 cwd=project_root,

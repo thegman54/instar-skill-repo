@@ -3,16 +3,15 @@ Repo Diff Tool - Show git diff.
 """
 
 import subprocess
-from pathlib import Path
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import validate_path, validate_project_root
+from .base import resolve_repo_path, validate_project_root
 
 
 @register_tool
 class RepoDiffTool(BaseTool):
-    """Show git diff of changes."""
+    """Show git diff for the repository."""
 
     @property
     def name(self) -> str:
@@ -20,59 +19,58 @@ class RepoDiffTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return (
-            "Show git diff of changes in the repository. "
-            "Can show all changes or diff for a specific file."
-        )
+        return "Show git diff — unstaged changes by default, or staged changes with the staged flag."
 
     @property
     def input_schema(self) -> dict:
         return {
             "type": "object",
             "properties": {
-                "path": {
+                "repo": {
                     "type": "string",
-                    "description": "Specific file to diff (optional, defaults to all)",
+                    "description": "Repository in owner/repo format",
                 },
                 "staged": {
                     "type": "boolean",
-                    "description": "Show staged changes only (default: false)",
+                    "description": "Show staged changes instead of unstaged (default: false)",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Limit diff to specific file or directory",
                 },
             },
+            "required": ["repo"],
         }
 
     @property
     def requires_grant_metadata(self) -> list[str]:
-        return ["project_root"]
+        return ["allowed_repos"]
 
     def credential_keys(self) -> list[str]:
         return []
 
     async def execute(
         self,
-        path: str = None,
+        repo: str,
         staged: bool = False,
+        path: str = None,
         **kwargs
     ) -> ToolResult:
-        project_root = self.get_grant_metadata("project_root")
+        allowed_repos = self.get_grant_metadata("allowed_repos")
+        valid, project_root, error = resolve_repo_path(repo, allowed_repos)
+        if not valid:
+            return ToolResult.fail(error)
 
         valid, error = validate_project_root(project_root)
         if not valid:
             return ToolResult.fail(error)
 
-        # If specific path, validate it
-        if path:
-            valid, abs_path, error = validate_path(project_root, path)
-            if not valid:
-                return ToolResult.fail(error)
-
         try:
-            cmd = ["git", "diff"]
+            cmd = ["git", "diff", "--no-color"]
             if staged:
-                cmd.append("--staged")
+                cmd.append("--cached")
             if path:
-                cmd.append("--")
-                cmd.append(path)
+                cmd.extend(["--", path])
 
             result = subprocess.run(
                 cmd,
@@ -83,25 +81,22 @@ class RepoDiffTool(BaseTool):
             )
 
             if result.returncode != 0:
-                return ToolResult.fail(f"Git error: {result.stderr}")
+                return ToolResult.fail(f"Diff error: {result.stderr}")
 
-            diff = result.stdout
-
-            # Truncate very large diffs
+            output = result.stdout
             max_chars = 50000
-            truncated = len(diff) > max_chars
+            truncated = len(output) > max_chars
             if truncated:
-                diff = diff[:max_chars] + "\n... [diff truncated]"
+                output = output[:max_chars]
 
             return ToolResult.ok({
-                "path": path or "(all files)",
                 "staged": staged,
-                "diff": diff,
+                "diff": output,
                 "truncated": truncated,
-                "has_changes": len(diff.strip()) > 0,
+                "empty": not output.strip(),
             })
 
         except subprocess.TimeoutExpired:
-            return ToolResult.fail("Git command timed out")
+            return ToolResult.fail("Diff timed out")
         except Exception as e:
             return ToolResult.fail(f"Diff error: {str(e)}")
