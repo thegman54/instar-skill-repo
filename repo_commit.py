@@ -37,7 +37,7 @@ class RepoCommitTool(BaseTool):
         return []
 
     async def execute(self, repo: str, files: list[str], message: str, **kwargs) -> ToolResult:
-        valid, project_root, access, error = await check_repo_access(repo, "commit")
+        valid, project_root, access, error, _ = await check_repo_access(repo, "commit")
         if not valid:
             return ToolResult.fail(error)
 

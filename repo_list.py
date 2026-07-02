@@ -39,7 +39,7 @@ class RepoListTool(BaseTool):
         return []
 
     async def execute(self, repo: str, path: str = ".", pattern: str = None, recursive: bool = False, **kwargs) -> ToolResult:
-        valid, project_root, access, error = await check_repo_access(repo, "list")
+        valid, project_root, access, error, _ = await check_repo_access(repo, "list")
         if not valid:
             return ToolResult.fail(error)
 

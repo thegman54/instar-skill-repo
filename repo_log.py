@@ -39,7 +39,7 @@ class RepoLogTool(BaseTool):
         return []
 
     async def execute(self, repo: str, limit: int = 20, branch: str = None, oneline: bool = False, path: str = None, **kwargs) -> ToolResult:
-        valid, project_root, access, error = await check_repo_access(repo, "log")
+        valid, project_root, access, error, _ = await check_repo_access(repo, "log")
         if not valid:
             return ToolResult.fail(error)
 

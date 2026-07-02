@@ -53,7 +53,7 @@ class RepoReadTool(BaseTool):
         self, repo: str, path: str,
         start_line: int = None, end_line: int = None, **kwargs
     ) -> ToolResult:
-        valid, project_root, access, error = await check_repo_access(repo, "read")
+        valid, project_root, access, error, _ = await check_repo_access(repo, "read")
         if not valid:
             return ToolResult.fail(error)
 

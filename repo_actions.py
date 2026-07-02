@@ -39,7 +39,7 @@ class RepoActionsTool(BaseTool):
         return ["GITHUB_TOKEN"]
 
     async def execute(self, repo: str, limit: int = 10, branch: str = None, status: str = None, run_id: int = None, **kwargs) -> ToolResult:
-        valid, _, access, error = await check_repo_access(repo, "actions")
+        valid, _, access, error, _ = await check_repo_access(repo, "actions")
         if not valid:
             return ToolResult.fail(error)
 

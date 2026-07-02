@@ -2,7 +2,8 @@
 Repo Tools - Clone, read, write, search, commit, push, and manage git repositories.
 
 All tools validate repo access against the grant's allowed_repos list.
-Repos are cloned into /projects/workspace/<owner>/<repo>/.
+Repos are cloned into workspace-scoped paths (/projects/workspaces/<slug>/repos/<owner>/<repo>/)
+or the legacy flat layout (/projects/workspace/<owner>/<repo>/) for unassigned repos.
 """
 
 from .repo_clone import RepoCloneTool

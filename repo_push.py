@@ -38,7 +38,7 @@ class RepoPushTool(BaseTool):
         return ["GITHUB_TOKEN"]
 
     async def execute(self, repo: str, branch: str = None, set_upstream: bool = True, **kwargs) -> ToolResult:
-        valid, project_root, access, error = await check_repo_access(repo, "push")
+        valid, project_root, access, error, _ = await check_repo_access(repo, "push")
         if not valid:
             return ToolResult.fail(error)
 

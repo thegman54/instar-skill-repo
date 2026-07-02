@@ -38,7 +38,7 @@ class RepoBranchTool(BaseTool):
         return []
 
     async def execute(self, repo: str, action: str = "list", name: str = None, from_branch: str = None, **kwargs) -> ToolResult:
-        valid, project_root, access, error = await check_repo_access(repo, "branch")
+        valid, project_root, access, error, _ = await check_repo_access(repo, "branch")
         if not valid:
             return ToolResult.fail(error)
 

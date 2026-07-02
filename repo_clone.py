@@ -7,7 +7,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import WORKSPACE_ROOT, check_repo_access, sanitize_stderr
+from .base import check_repo_access, sanitize_stderr
 
 
 @register_tool
@@ -47,9 +47,13 @@ class RepoCloneTool(BaseTool):
         return ["GITHUB_TOKEN"]
 
     async def execute(self, repo: str, branch: str = None, **kwargs) -> ToolResult:
-        valid, workspace_path, access, error = await check_repo_access(repo, "clone")
+        valid, workspace_path, access, error, configured_branch = await check_repo_access(repo, "clone")
         if not valid:
             return ToolResult.fail(error)
+
+        # Use configured branch from repo config if no explicit branch passed
+        if not branch and configured_branch:
+            branch = configured_branch
 
         token = self.get_credential("GITHUB_TOKEN")
         clone_url = f"https://x-access-token:{token}@github.com/{repo}.git"
