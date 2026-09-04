@@ -96,6 +96,7 @@ class RepoCloneTool(BaseTool):
 
         self._configure_git(workspace_path)
         self._sanitize_remote(workspace_path, repo)
+        self._chown_workspace(workspace_path)
 
         info = self._get_repo_info(workspace_path)
 
@@ -105,6 +106,31 @@ class RepoCloneTool(BaseTool):
             "path": workspace_path,
             **info,
         })
+
+    @staticmethod
+    def _chown_workspace(workspace_path: str) -> None:
+        """Hand the clone to the unprivileged uid the rest of the stack runs as.
+
+        tool-executor runs as root, so a fresh clone lands root-owned. Anything that later
+        works IN that checkout as a normal user — a repo expert's runner at uid 1000, or the
+        operator on the host — then cannot write to it, and git additionally refuses to touch
+        it at all with "detected dubious ownership".
+
+        Non-fatal: a clone that exists but is owned by root is still a successful clone, and
+        failing the whole operation over a chown would be worse than reporting it.
+        """
+        uid = int(os.environ.get("WORKSPACE_UID", "1000"))
+        gid = int(os.environ.get("WORKSPACE_GID", "1000"))
+        try:
+            for root, dirs, files in os.walk(workspace_path):
+                os.chown(root, uid, gid)
+                for name in dirs + files:
+                    path = os.path.join(root, name)
+                    if not os.path.islink(path):
+                        os.chown(path, uid, gid)
+            os.chown(workspace_path, uid, gid)
+        except (OSError, PermissionError):
+            pass
 
     async def _update_existing(
         self, workspace_path: str, repo: str, branch: str = None, token: str = None
@@ -164,6 +190,7 @@ class RepoCloneTool(BaseTool):
 
         self._configure_git(workspace_path)
         self._sanitize_remote(workspace_path, repo)
+        self._chown_workspace(workspace_path)
 
         info = self._get_repo_info(workspace_path)
 
