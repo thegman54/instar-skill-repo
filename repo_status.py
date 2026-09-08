@@ -35,7 +35,7 @@ class RepoStatusTool(BaseTool):
         return []
 
     async def execute(self, repo: str, **kwargs) -> ToolResult:
-        valid, project_root, access, error, _ = await check_repo_access(repo, "status")
+        valid, project_root, access, error, _ = await check_repo_access(repo, "status", self._profile_slug)
         if not valid:
             return ToolResult.fail(error)
 

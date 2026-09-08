@@ -44,15 +44,32 @@ def sanitize_stderr(stderr: str) -> str:
     return _TOKEN_URL_PATTERN.sub('https://github.com/', stderr)
 
 
-async def check_repo_access(repo: str, operation: str = "read") -> tuple[bool, str, str, str, str]:
-    """
-    Check if a repo is allowed and the operation is permitted.
+# Operations a cross-workspace grant may cover. Reading a neighbouring repository answers a
+# question; writing to one changes somebody else's work. `repo_read_all` therefore grants only
+# these, and never write/commit/push/pr — so read-many can never quietly become
+# read-many/write-many, which is the combination the whole confinement model exists to prevent.
+READ_OPS = {"clone", "read", "list", "grep", "status", "diff", "log", "branch", "actions"}
 
-    Queries the skill_repo_config table for access control.
+
+async def check_repo_access(repo: str, operation: str = "read",
+                            profile_slug: str = None) -> tuple[bool, str, str, str, str]:
+    """
+    Check if a repo is allowed and the operation is permitted, FOR THIS PROFILE.
+
+    Access is scoped to the calling profile's workspace. It used to be scoped to nothing at
+    all — the lookup matched on repository name alone, so any profile holding repo_read could
+    read every repository in skill_repo_config. Nothing leaked, because the table happens to
+    hold only Cenora repositories; but the protection was the contents of a table rather than
+    a rule, and adding one unrelated repository would have exposed it to every profile with no
+    warning.
+
+    A profile may hold `repo_read_all` to read outside its workspace — the coordinator does,
+    because cross-repo questions are its entire job. That grant covers READ_OPS only.
 
     Args:
         repo: Repository in "owner/repo" format
         operation: The operation being attempted (clone, read, write, push, pr, etc.)
+        profile_slug: The calling profile. Without it, only same-workspace access is possible.
 
     Returns:
         (valid, workspace_path, access_level, error_message, branch)
@@ -90,6 +107,29 @@ async def check_repo_access(repo: str, operation: str = "read") -> tuple[bool, s
 
     if operation not in allowed_ops:
         return False, "", access, f"Operation '{operation}' not allowed — repo has '{access}' access", None
+
+    # --- scope: is this repo in the caller's workspace, or is the caller granted breadth? ---
+    #
+    # Repos with no workspace are the legacy flat layout. There is nothing to compare against,
+    # so scoping cannot apply and they behave as before rather than becoming unreachable.
+    if row["workspace_id"] and profile_slug:
+        async with pool.acquire() as conn:
+            prof = await conn.fetchrow(
+                "SELECT workspace_id, repo_read_all FROM bot_profiles WHERE slug = $1",
+                profile_slug)
+        same_workspace = bool(prof and prof["workspace_id"]
+                              and str(prof["workspace_id"]) == str(row["workspace_id"]))
+        read_all = bool(prof and prof["repo_read_all"])
+
+        if not same_workspace:
+            if operation not in READ_OPS:
+                return False, "", access, (
+                    f"'{repo}' is outside this profile's workspace, and '{operation}' writes. "
+                    "Cross-workspace access is read-only, always."), None
+            if not read_all:
+                return False, "", access, (
+                    f"'{repo}' is not in this profile's workspace. Reading outside it requires "
+                    "the repo_read_all grant, which this profile does not have."), None
 
     # Resolve workspace path — workspace-scoped if assigned, legacy flat otherwise
     if row["workspace_slug"]:

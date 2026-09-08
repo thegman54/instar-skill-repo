@@ -45,7 +45,7 @@ class RepoPRTool(BaseTool):
         self, repo: str, title: str, body: str,
         head: str = None, base: str = "main", draft: bool = False, **kwargs
     ) -> ToolResult:
-        valid, project_root, access, error, _ = await check_repo_access(repo, "pr")
+        valid, project_root, access, error, _ = await check_repo_access(repo, "pr", self._profile_slug)
         if not valid:
             return ToolResult.fail(error)
 

@@ -47,7 +47,7 @@ class RepoCloneTool(BaseTool):
         return ["GITHUB_TOKEN"]
 
     async def execute(self, repo: str, branch: str = None, **kwargs) -> ToolResult:
-        valid, workspace_path, access, error, configured_branch = await check_repo_access(repo, "clone")
+        valid, workspace_path, access, error, configured_branch = await check_repo_access(repo, "clone", self._profile_slug)
         if not valid:
             return ToolResult.fail(error)
 
