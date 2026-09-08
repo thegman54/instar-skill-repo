@@ -112,7 +112,16 @@ async def check_repo_access(repo: str, operation: str = "read",
     #
     # Repos with no workspace are the legacy flat layout. There is nothing to compare against,
     # so scoping cannot apply and they behave as before rather than becoming unreachable.
-    if row["workspace_id"] and profile_slug:
+    if row["workspace_id"]:
+        # No caller identity means no way to prove the repo is in scope, so it is not. This
+        # branch was originally `and profile_slug`, which skipped the whole check when the
+        # profile was unknown — an unidentified caller got unrestricted read, which is the
+        # exact hole being closed. Fail closed and say why.
+        if not profile_slug:
+            return False, "", access, (
+                f"Cannot scope access to '{repo}': the calling profile is unknown. "
+                "Repository access is per-profile; an unidentified caller gets none."), None
+
         async with pool.acquire() as conn:
             prof = await conn.fetchrow(
                 "SELECT workspace_id, repo_read_all FROM bot_profiles WHERE slug = $1",
