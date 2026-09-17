@@ -8,7 +8,7 @@ import httpx
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import check_repo_access, validate_project_root
+from .base import git_env, check_repo_access, validate_project_root
 
 
 @register_tool
@@ -59,6 +59,7 @@ class RepoPRTool(BaseTool):
             branch_result = subprocess.run(
                 ["git", "branch", "--show-current"],
                 cwd=project_root, capture_output=True, text=True, timeout=10,
+                env=git_env(),
             )
             if branch_result.returncode != 0:
                 return ToolResult.fail("Could not determine current branch for PR head")

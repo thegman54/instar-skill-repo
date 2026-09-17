@@ -7,7 +7,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import check_repo_access, sanitize_stderr
+from .base import check_repo_access, git_env, sanitize_stderr
 
 
 @register_tool
@@ -142,7 +142,8 @@ class RepoCloneTool(BaseTool):
             capture_output=True,
             text=True,
             timeout=10,
-        )
+                env=git_env(),
+            )
         if remote_result.returncode == 0:
             current_remote = remote_result.stdout.strip()
             if f"github.com/{repo}" not in current_remote:
@@ -160,25 +161,44 @@ class RepoCloneTool(BaseTool):
                 capture_output=True,
                 text=True,
                 timeout=10,
+                env=git_env(),
             )
 
         if branch:
-            subprocess.run(
+            checkout = subprocess.run(
                 ["git", "checkout", branch],
                 cwd=workspace_path,
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env=git_env(),
             )
+            if checkout.returncode != 0:
+                self._sanitize_remote(workspace_path, repo)
+                return ToolResult.fail(
+                    f"Could not check out '{branch}': "
+                    f"{sanitize_stderr(checkout.stderr)}"
+                )
 
-        subprocess.run(
+        # Every result below is CHECKED, and the reason is a bug this exact function had:
+        # none of these returncodes were read, so a fetch that failed for any reason at all
+        # still returned ok() with the untouched checkout's details. Eleven repositories
+        # reported "updated" — one of them 99 commits behind — while nothing moved. A stale
+        # checkout that says it is current is worse than one that says it failed, because an
+        # expert then reasons confidently about code that is months old.
+        fetch = subprocess.run(
             ["git", "fetch", "origin"],
             cwd=workspace_path,
             capture_output=True,
             text=True,
             timeout=60,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            env=git_env(),
         )
+        if fetch.returncode != 0:
+            self._sanitize_remote(workspace_path, repo)
+            return ToolResult.fail(
+                f"Fetch failed for {repo}: {sanitize_stderr(fetch.stderr)}"
+            )
 
         pull_result = subprocess.run(
             ["git", "pull", "--ff-only"],
@@ -186,11 +206,22 @@ class RepoCloneTool(BaseTool):
             capture_output=True,
             text=True,
             timeout=60,
+            env=git_env(),
         )
 
         self._configure_git(workspace_path)
         self._sanitize_remote(workspace_path, repo)
         self._chown_workspace(workspace_path)
+
+        if pull_result.returncode != 0:
+            # Not a fast-forward, or a dirty tree. Reported rather than forced: a workspace
+            # that has diverged is a question, and resetting it here would silently discard
+            # whatever caused the divergence.
+            return ToolResult.fail(
+                f"Pull is not a fast-forward for {repo} — the checkout has diverged or is "
+                f"dirty, so it was left exactly as it was. "
+                f"{sanitize_stderr(pull_result.stderr or pull_result.stdout)}"
+            )
 
         info = self._get_repo_info(workspace_path)
 
@@ -208,32 +239,37 @@ class RepoCloneTool(BaseTool):
         subprocess.run(
             ["git", "config", "user.email", "bot@instar.local"],
             cwd=workspace_path, capture_output=True, timeout=5,
-        )
+                env=git_env(),
+            )
         subprocess.run(
             ["git", "config", "user.name", "Instar Bot"],
             cwd=workspace_path, capture_output=True, timeout=5,
-        )
+                env=git_env(),
+            )
 
     def _sanitize_remote(self, workspace_path: str, repo: str):
         clean_url = f"https://github.com/{repo}.git"
         subprocess.run(
             ["git", "remote", "set-url", "origin", clean_url],
             cwd=workspace_path, capture_output=True, text=True, timeout=5,
-        )
+                env=git_env(),
+            )
 
     def _get_repo_info(self, workspace_path: str) -> dict:
         info = {}
         branch_result = subprocess.run(
             ["git", "branch", "--show-current"],
             cwd=workspace_path, capture_output=True, text=True, timeout=5,
-        )
+                env=git_env(),
+            )
         if branch_result.returncode == 0:
             info["branch"] = branch_result.stdout.strip()
 
         head_result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=workspace_path, capture_output=True, text=True, timeout=5,
-        )
+                env=git_env(),
+            )
         if head_result.returncode == 0:
             info["head"] = head_result.stdout.strip()
 

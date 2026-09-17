@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import check_repo_access, validate_project_root
+from .base import git_env, check_repo_access, validate_project_root
 
 
 @register_tool
@@ -58,7 +58,8 @@ class RepoLogTool(BaseTool):
             if path:
                 cmd.extend(["--", path])
 
-            result = subprocess.run(cmd, cwd=project_root, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(cmd, cwd=project_root, capture_output=True, text=True,
+                                    timeout=30, env=git_env())
             if result.returncode != 0:
                 return ToolResult.fail(f"Git error: {result.stderr}")
 

@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import check_repo_access, validate_path, validate_project_root
+from .base import git_env, check_repo_access, validate_path, validate_project_root
 
 
 @register_tool
@@ -61,6 +61,7 @@ class RepoCommitTool(BaseTool):
             stage_result = subprocess.run(
                 ["git", "add", "--"] + validated_files,
                 cwd=project_root, capture_output=True, text=True, timeout=30,
+                env=git_env(),
             )
             if stage_result.returncode != 0:
                 return ToolResult.fail(f"Stage error: {stage_result.stderr}")
@@ -69,6 +70,7 @@ class RepoCommitTool(BaseTool):
             commit_result = subprocess.run(
                 ["git", "commit", "-m", full_message],
                 cwd=project_root, capture_output=True, text=True, timeout=30,
+                env=git_env(),
             )
             if commit_result.returncode != 0:
                 if "nothing to commit" in commit_result.stdout.lower():
@@ -78,6 +80,7 @@ class RepoCommitTool(BaseTool):
             hash_result = subprocess.run(
                 ["git", "rev-parse", "--short", "HEAD"],
                 cwd=project_root, capture_output=True, text=True, timeout=10,
+                env=git_env(),
             )
             commit_hash = hash_result.stdout.strip() if hash_result.returncode == 0 else "unknown"
 

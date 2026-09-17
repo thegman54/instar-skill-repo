@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import check_repo_access, validate_project_root
+from .base import git_env, check_repo_access, validate_project_root
 
 
 @register_tool
@@ -47,6 +47,7 @@ class RepoStatusTool(BaseTool):
             result = subprocess.run(
                 ["git", "status", "--porcelain"],
                 cwd=project_root, capture_output=True, text=True, timeout=15,
+                env=git_env(),
             )
             if result.returncode != 0:
                 return ToolResult.fail(f"Git error: {result.stderr}")
@@ -67,6 +68,7 @@ class RepoStatusTool(BaseTool):
             branch_result = subprocess.run(
                 ["git", "branch", "--show-current"],
                 cwd=project_root, capture_output=True, text=True, timeout=5,
+                env=git_env(),
             )
             branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "unknown"
 

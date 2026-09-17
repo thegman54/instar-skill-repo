@@ -7,7 +7,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import check_repo_access, sanitize_stderr, validate_project_root
+from .base import git_env, check_repo_access, sanitize_stderr, validate_project_root
 
 
 @register_tool
@@ -53,6 +53,7 @@ class RepoPushTool(BaseTool):
             remote_result = subprocess.run(
                 ["git", "remote", "get-url", "origin"],
                 cwd=project_root, capture_output=True, text=True, timeout=10,
+                env=git_env(),
             )
             if remote_result.returncode == 0:
                 current_remote = remote_result.stdout.strip()
@@ -66,13 +67,15 @@ class RepoPushTool(BaseTool):
             subprocess.run(
                 ["git", "remote", "set-url", "origin", auth_url],
                 cwd=project_root, capture_output=True, text=True, timeout=10,
+                env=git_env(),
             )
 
             if not branch:
                 branch_result = subprocess.run(
                     ["git", "branch", "--show-current"],
                     cwd=project_root, capture_output=True, text=True, timeout=10,
-                )
+                env=git_env(),
+            )
                 if branch_result.returncode != 0:
                     return ToolResult.fail("Could not determine current branch")
                 branch = branch_result.stdout.strip()
@@ -93,6 +96,7 @@ class RepoPushTool(BaseTool):
             subprocess.run(
                 ["git", "remote", "set-url", "origin", clean_url],
                 cwd=project_root, capture_output=True, text=True, timeout=5,
+                env=git_env(),
             )
 
             if result.returncode != 0:
@@ -111,7 +115,8 @@ class RepoPushTool(BaseTool):
                 subprocess.run(
                     ["git", "remote", "set-url", "origin", f"https://github.com/{repo}.git"],
                     cwd=project_root, capture_output=True, timeout=5,
-                )
+                env=git_env(),
+            )
             except Exception:
                 pass
             return ToolResult.fail("Push timed out")

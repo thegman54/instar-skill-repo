@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import check_repo_access, validate_project_root
+from .base import git_env, check_repo_access, validate_project_root
 
 
 @register_tool
@@ -48,10 +48,14 @@ class RepoBranchTool(BaseTool):
 
         try:
             if action == "list":
-                result = subprocess.run(["git", "branch", "-a", "-v"], cwd=project_root, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(["git", "branch", "-a", "-v"], cwd=project_root, capture_output=True, text=True, timeout=30,
+                env=git_env(),
+            )
                 if result.returncode != 0:
                     return ToolResult.fail(f"Git error: {result.stderr}")
-                current = subprocess.run(["git", "branch", "--show-current"], cwd=project_root, capture_output=True, text=True, timeout=10)
+                current = subprocess.run(["git", "branch", "--show-current"], cwd=project_root, capture_output=True, text=True, timeout=10,
+                env=git_env(),
+            )
                 return ToolResult.ok({"current": current.stdout.strip() if current.returncode == 0 else "unknown", "branches": result.stdout.strip()})
 
             elif action == "create":
@@ -70,7 +74,9 @@ class RepoBranchTool(BaseTool):
             elif action == "switch":
                 if not name:
                     return ToolResult.fail("Branch name required for switch")
-                result = subprocess.run(["git", "checkout", name], cwd=project_root, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(["git", "checkout", name], cwd=project_root, capture_output=True, text=True, timeout=30,
+                env=git_env(),
+            )
                 if result.returncode != 0:
                     stderr = result.stderr.lower()
                     if "did not match" in stderr or "not found" in stderr:

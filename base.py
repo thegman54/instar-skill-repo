@@ -25,6 +25,40 @@ BLOCKED_PATHS = [
     "/projects/project-instar",  # Self-modification forbidden
 ]
 
+# Let git operate on checkouts this process does not own.
+#
+# THE MISMATCH IS DELIBERATE ON BOTH SIDES. This container runs as root; every clone is
+# handed to uid 1000 by _chown_workspace so the expert-runner, which runs unprivileged, can
+# use the same checkout. Root can read and write those files perfectly well — it is only
+# git's ownership CHECK that objects, and it objects to every git invocation in this skill:
+# status, log, diff, branch, commit, push, and the fetch inside repo_clone.
+#
+# So safe.directory is the remedy git documents for exactly this, not a workaround. The check
+# exists to stop you running a repo owned by an untrusted OTHER user; here the other user is
+# one we created, on a path this skill already gates through check_repo_access.
+#
+# Set as GIT_CONFIG_* env rather than written into a config file so it applies to every
+# subprocess without a file on disk to drift, and so it cannot leak into the checkouts
+# themselves — a `git config` write would land in a repository the bots push from.
+GIT_SAFE_ENV = {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "safe.directory",
+    "GIT_CONFIG_VALUE_0": "*",
+}
+
+
+def git_env(extra: dict = None) -> dict:
+    """Environment for any git subprocess in this skill.
+
+    Always use this instead of os.environ. GIT_TERMINAL_PROMPT=0 matters as much as the
+    ownership setting: without it a git that wants credentials blocks on a prompt nobody
+    can answer, and the call hangs until its timeout instead of failing.
+    """
+    env = {**os.environ, **GIT_SAFE_ENV, "GIT_TERMINAL_PROMPT": "0"}
+    if extra:
+        env.update(extra)
+    return env
+
 # Valid repo format: owner/repo-name
 REPO_PATTERN = re.compile(r'^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$')
 
