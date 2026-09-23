@@ -15,6 +15,7 @@ from .repo_status import RepoStatusTool
 from .repo_diff import RepoDiffTool
 from .repo_commit import RepoCommitTool
 from .repo_push import RepoPushTool
+from .repo_git import RepoGitTool
 from .repo_pr import RepoPRTool
 from .repo_log import RepoLogTool
 from .repo_branch import RepoBranchTool
@@ -30,6 +31,7 @@ __all__ = [
     'RepoDiffTool',
     'RepoCommitTool',
     'RepoPushTool',
+    'RepoGitTool',
     'RepoPRTool',
     'RepoLogTool',
     'RepoBranchTool',
