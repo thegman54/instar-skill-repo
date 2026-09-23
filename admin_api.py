@@ -175,11 +175,49 @@ async def check_access(pool, body=None, repo_name=None, **kw):
         }
 
 
+
+
+async def git_remote(pool, body=None, **kw):
+    """Remote git for a caller that holds no credential — git-gate's only way to a remote.
+
+    Shares `remote_op` with the MCP tool rather than re-implementing the rules, because a
+    security check written twice becomes two checks, and the one nobody is reading is the one
+    that stays permissive.
+
+    RESIDUAL RISK, stated rather than hidden: this route has no caller authentication, so
+    anything already on the internal network can call it. That is not nothing, but it is
+    bounded in the way that matters — the only refs it will push are ones that correspond to
+    work the coordinator actually created, in a repo that work belongs to. An attacker on the
+    internal network gains "can push a branch the coordinator already asked for", not "can
+    push anything". Caller identity is the next thing to add here, not the last.
+    """
+    body = body or {}
+    repo = (body.get("repo") or "").strip()
+    op = (body.get("op") or "").strip()
+    ref = (body.get("ref") or "").strip()
+    profile_slug = (body.get("profile_slug") or "").strip()
+    if not repo or not op:
+        return {"ok": False, "error": "repo and op are required"}
+
+    from .repo_git import remote_op
+    try:
+        ok, payload = await remote_op(repo, op, ref, profile_slug,
+                                      ticket_hint=(body.get("ticket") or "").strip())
+    except Exception as exc:
+        log.warning("git_remote_failed", repo=repo, op=op, ref=ref, error=str(exc)[:200])
+        return {"ok": False, "error": f"{op} failed: {str(exc)[:300]}"}
+
+    if not ok:
+        log.info("git_remote_refused", repo=repo, op=op, ref=ref, reason=str(payload)[:200])
+        return {"ok": False, "error": payload}
+    return {"ok": True, **payload}
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 routes = [
+    ("POST",   r"/git-remote$",                         git_remote),
     ("GET",    r"/repos$",                              list_repos),
     ("POST",   r"/repos$",                              add_repo),
     ("PUT",    r"/repos/(?P<repo_id>[\w-]+)$",          update_repo),
