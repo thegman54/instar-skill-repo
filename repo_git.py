@@ -143,9 +143,60 @@ async def may_push(repo: str, ref: str) -> tuple:
                    "Nothing else is pushable, including branches that merely look similar.")
 
 
+
+async def _record(repo: str, op: str, ref: str, decision: str, reason: str,
+                  profile_slug: str = "") -> None:
+    """Write the decision down. Never raises.
+
+    Best-effort on purpose, and in the opposite direction to the checks: a check that cannot
+    confirm it is allowed refuses, but a RECORD that cannot be written must not turn a
+    legitimate push into a failure. Losing a row costs visibility; refusing here would cost
+    work that was properly authorised.
+    """
+    try:
+        from ...db import get_pool
+        pool = get_pool()
+        if not pool:
+            return
+        ticket = ""
+        if ref.startswith(BOT_PREFIX) and TICKET_RE.match(ref[len(BOT_PREFIX):]):
+            ticket = ref[len(BOT_PREFIX):]
+        elif ref.startswith(RELEASE_PREFIX):
+            ticket = ref[len(RELEASE_PREFIX):]
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO repo_git_decisions
+                       (repo, op, ref, decision, reason, profile_slug, ticket)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7)""",
+                repo, op, ref, decision, (reason or "")[:2000], profile_slug, ticket)
+    except Exception as exc:
+        log.warning("repo_git_record_failed", repo=repo, op=op, error=str(exc)[:200])
+
+
 async def remote_op(repo: str, op: str, ref: str = "", profile_slug: str = "",
                     token: str = None, ticket_hint: str = "") -> tuple:
-    """Validate and perform one remote operation. Returns (ok, payload_or_reason)."""
+    """Validate, perform, and RECORD one remote operation. Returns (ok, payload_or_reason).
+
+    Recording happens here, around the whole decision, rather than at each return. A dozen
+    exits each responsible for remembering to log is a design where one of them eventually
+    does not, and the one that forgets is never the boring one.
+    """
+    ok, payload = await _decide(repo, op, ref, profile_slug, token, ticket_hint)
+    if ok:
+        why = payload.get("why_allowed") or f"{op} performed"
+        await _record(repo, op, ref, "allowed", why, profile_slug)
+    else:
+        # A rule saying no and git falling over are different events with different
+        # follow-ups, so they are not collapsed into one status.
+        failed = any(m in str(payload) for m in ("failed:", "could not", "timed out"))
+        await _record(repo, op, ref, "failed" if failed else "refused",
+                      str(payload), profile_slug)
+    return ok, payload
+
+
+async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
+                  token: str = None, ticket_hint: str = "") -> tuple:
+    """The decision itself, with no knowledge of how it gets recorded."""
     if op not in ("fetch", "push", "promote"):
         return False, f"unknown op {op!r} — expected fetch, push or promote"
 
