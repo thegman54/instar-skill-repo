@@ -158,18 +158,34 @@ async def check_repo_access(repo: str, operation: str = "read",
 
         async with pool.acquire() as conn:
             prof = await conn.fetchrow(
-                "SELECT workspace_id, repo_read_all FROM bot_profiles WHERE slug = $1",
+                "SELECT workspace_id, repo_read_all, repo_write_all "
+                "  FROM bot_profiles WHERE slug = $1",
                 profile_slug)
         same_workspace = bool(prof and prof["workspace_id"]
                               and str(prof["workspace_id"]) == str(row["workspace_id"]))
         read_all = bool(prof and prof["repo_read_all"])
+        write_all = bool(prof and prof["repo_write_all"])
 
         if not same_workspace:
-            if operation not in READ_OPS:
+            # WHY THIS EXISTS, given the paragraph above says read-many must never become
+            # read-many/write-many. That rule protects tenants from each other, and there is one
+            # operator here. The fleet moved to a SINGLE dev covering every repository, which
+            # cannot work under per-workspace confinement at all: repos are roughly one per
+            # workspace, and the dev must write in all of them.
+            #
+            # The confinement was not what kept the bots honest anyway. git-gate is — a push
+            # needs an open work unit for (repo, ticket), the protected branch names are refused
+            # outright, and it fails closed when it cannot check. Those are untouched by this,
+            # and they are the guarantees that actually held during every incident so far.
+            #
+            # A SEPARATE flag rather than widening repo_read_all, so a profile that only needs to
+            # read its neighbours still cannot write to them, and so granting this stays a
+            # visible decision on whichever profile holds it.
+            if operation not in READ_OPS and not write_all:
                 return False, "", access, (
                     f"'{repo}' is outside this profile's workspace, and '{operation}' writes. "
-                    "Cross-workspace access is read-only, always."), None
-            if not read_all:
+                    "That needs the repo_write_all grant, which this profile does not have."), None
+            if operation in READ_OPS and not (read_all or write_all):
                 return False, "", access, (
                     f"'{repo}' is not in this profile's workspace. Reading outside it requires "
                     "the repo_read_all grant, which this profile does not have."), None
