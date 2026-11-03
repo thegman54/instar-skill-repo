@@ -20,8 +20,10 @@ from .repo_pr import RepoPRTool
 from .repo_log import RepoLogTool
 from .repo_branch import RepoBranchTool
 from .repo_actions import RepoActionsTool
+from .ticket_precedent import TicketPrecedentTool
 
 __all__ = [
+    'TicketPrecedentTool',
     'RepoCloneTool',
     'RepoListTool',
     'RepoReadTool',
