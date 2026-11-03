@@ -291,11 +291,19 @@ class RepoLocateTool(BaseTool):
         # Where the work goes versus where the spec is. A repo whose every hit is in
         # documentation is not a destination, and offering it as one is how a loader repo
         # ends up owning an API change because it happens to hold the vendor's swagger.
-        destinations = [r for r in found if r["source_hits"] or r["path_hits"]]
+        # ONE weak hit is not a destination. A single resolved path with nothing else is
+        # usually a file every fork of this codebase has (an auth driver, a middleware), and
+        # promoting that to "the work goes here" manufactured a two-repo fan-out for CLC-4555
+        # out of a shared cognito.js. Two independent signals, or one of each kind.
+        def _destination(r: dict) -> bool:
+            return (r["path_hits"] >= 2 or r["source_hits"] >= 2
+                    or (r["path_hits"] >= 1 and r["source_hits"] >= 1))
+
+        destinations = [r for r in found if _destination(r)]
         references = [{"repo": r["repo"],
                        "files": sorted({m["file"] for m in r["matches"]})[:6],
                        "terms": sorted({m["term"] for m in r["matches"]})}
-                      for r in found if not (r["source_hits"] or r["path_hits"])]
+                      for r in found if not _destination(r)]
 
         out = {
             "searched": {"repos": len(candidates[:MAX_REPOS]), "terms": [w["term"] for w in wanted]},
@@ -343,7 +351,12 @@ class RepoLocateTool(BaseTool):
             # agreement discarded `controllers/links/post.js` — a file that exists — because
             # three other post.js files sorted ahead of it, and it was then reported as
             # "found in no repository", i.e. as greenfield work.
-            tail = "/".join(term.replace("\\", "/").lower().split("/")[-2:]) if "/" in term else ""
+            # As many segments as the ticket gave, not a fixed two. These codebases are
+            # forks of each other — `libs/auth/drivers/cognito/cognito.js` exists verbatim in
+            # dpov-core-services and in cenora-agency-links-api — so two segments matches the
+            # wrong repository as readily as the right one, while the four the author wrote
+            # at least narrow it to the repos that really share the file.
+            tail = "/".join(term.replace("\\", "/").lower().split("/")[-4:]) if "/" in term else ""
             if tail:
                 cands = [r for r in cands if r.lower().endswith(tail)]
             for real in cands[:3]:
