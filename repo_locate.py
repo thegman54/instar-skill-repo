@@ -300,10 +300,16 @@ class RepoLocateTool(BaseTool):
                     or (r["path_hits"] >= 1 and r["source_hits"] >= 1))
 
         destinations = [r for r in found if _destination(r)]
+        # Only repos whose EVERY hit is documentation. A repo that fell under the
+        # destination bar on one shared source file is not "the spec lives here", and
+        # labelling it that way sends a dev to read an auth driver as though it were an API
+        # reference.
         references = [{"repo": r["repo"],
                        "files": sorted({m["file"] for m in r["matches"]})[:6],
                        "terms": sorted({m["term"] for m in r["matches"]})}
-                      for r in found if not _destination(r)]
+                      for r in found
+                      if not _destination(r)
+                      and r["matches"] and all(m["where"] == "reference" for m in r["matches"])]
 
         out = {
             "searched": {"repos": len(candidates[:MAX_REPOS]), "terms": [w["term"] for w in wanted]},
