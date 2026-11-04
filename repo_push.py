@@ -1,18 +1,41 @@
 """
-Repo Push Tool - Push commits to remote using GITHUB_TOKEN.
+repo_push — the old name for publishing a branch, routed through the one gate.
+
+WHY THIS FILE NO LONGER PUSHES ANYTHING ITSELF. It used to fetch GITHUB_TOKEN, rewrite
+`origin` to embed it, and run `git push` behind nothing but `check_repo_access`. That meant
+any ref, on any configured repo the profile could write, with no work unit and no branch
+rules — including `production`. `repo_git` exists precisely to stop that, and its header
+says why: a rule enforced by the caller is not a rule.
+
+Having both on a belt made the gate optional, and on 2026-11-03 both were on all three
+fleet belts while `fleet_cen_dev` held repo_write_all over 26 repos configured `full`. The
+expert's own instructions told it writes go through git-gate, and it believed them — it
+told QA "git push is unavailable to me" while holding this tool. The documentation was
+right about the design and wrong about the system.
+
+So this is now a thin caller of `remote_op`, the same entry point the MCP tool and git-gate
+use. Deleting the tool outright was the alternative; keeping the name and removing the
+capability is better, because a belt that still lists `repo_push` now gets the gate instead
+of silently getting around it. There is no ordering in which the checks are skipped and the
+push still happens, because the check and the push are the same call.
+
+What that means in practice: `bot/<TICKET>` needs an open work unit for this repo and that
+ticket, `release/<KEY>` needs release-group membership, environment branches are refused and
+go through the fleet's promotion approval, and every outcome is recorded whether allowed or
+refused.
 """
 
-import os
 import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import git_env, check_repo_access, sanitize_stderr, validate_project_root
+from .base import check_repo_access, git_env, validate_project_root
+from .repo_git import remote_op
 
 
 @register_tool
 class RepoPushTool(BaseTool):
-    """Push commits to the remote repository."""
+    """Publish a branch, through the same gate every other remote operation uses."""
 
     @property
     def name(self) -> str:
@@ -20,7 +43,18 @@ class RepoPushTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Push local commits to the remote repository using authenticated credentials."
+        return (
+            "Publish a branch to the remote, through the branch gate. A `bot/<TICKET>` branch "
+            "is pushed only when an open work unit exists for this repo and that ticket; "
+            "`release/<KEY>` only for a member of that release group. Environment branches "
+            "(production, staging, testing) are never pushed here — reaching an environment "
+            "goes through the fleet's promotion approval, which a person grants.\n\n"
+            "Identical rules to repo_git's push, because it is the same call."
+        )
+
+    @property
+    def short_description(self) -> str:
+        return "Publish a branch through the branch gate"
 
     @property
     def input_schema(self) -> dict:
@@ -28,97 +62,45 @@ class RepoPushTool(BaseTool):
             "type": "object",
             "properties": {
                 "repo": {"type": "string", "description": "Repository in owner/repo format"},
-                "branch": {"type": "string", "description": "Branch to push (default: current branch)"},
-                "set_upstream": {"type": "boolean", "description": "Set upstream tracking (default: true)"},
+                "branch": {"type": "string",
+                           "description": "Branch to publish. Defaults to the checked-out "
+                                          "branch, which is resolved and then gated like any "
+                                          "other ref — the default is not an exemption"},
             },
             "required": ["repo"],
         }
 
     def credential_keys(self) -> list[str]:
-        return ["GITHUB_TOKEN"]
+        # Deliberately none. The token is fetched inside remote_op, in the process that makes
+        # the decision. A tool that holds a credential it does not use is a credential one
+        # edit away from being used.
+        return []
 
-    async def execute(self, repo: str, branch: str = None, set_upstream: bool = True, **kwargs) -> ToolResult:
-        valid, project_root, access, error, _ = await check_repo_access(repo, "push", self._profile_slug)
+    async def execute(self, repo: str, branch: str = None, **kwargs) -> ToolResult:
+        # Resolved with a read-only access check so that naming an unconfigured or
+        # out-of-scope repo fails here with a clear reason, rather than inside the gate.
+        valid, project_root, _access, error, _branch = await check_repo_access(
+            repo, "read", self._profile_slug)
         if not valid:
             return ToolResult.fail(error)
 
-        valid, error = validate_project_root(project_root)
-        if not valid:
-            return ToolResult.fail(error)
-
-        token = self.get_credential("GITHUB_TOKEN")
-
-        try:
-            # Verify remote points to the expected repo
-            remote_result = subprocess.run(
-                ["git", "remote", "get-url", "origin"],
-                cwd=project_root, capture_output=True, text=True, timeout=10,
-                env=git_env(),
-            )
-            if remote_result.returncode == 0:
-                current_remote = remote_result.stdout.strip()
-                if f"github.com/{repo}" not in current_remote:
-                    return ToolResult.fail(
-                        f"Remote URL mismatch — expected github.com/{repo}. Possible tampering."
-                    )
-
-            # Temporarily set token URL for push
-            auth_url = f"https://x-access-token:{token}@github.com/{repo}.git"
-            subprocess.run(
-                ["git", "remote", "set-url", "origin", auth_url],
-                cwd=project_root, capture_output=True, text=True, timeout=10,
-                env=git_env(),
-            )
-
-            if not branch:
-                branch_result = subprocess.run(
-                    ["git", "branch", "--show-current"],
-                    cwd=project_root, capture_output=True, text=True, timeout=10,
-                env=git_env(),
-            )
-                if branch_result.returncode != 0:
-                    return ToolResult.fail("Could not determine current branch")
-                branch = branch_result.stdout.strip()
-
-            cmd = ["git", "push"]
-            if set_upstream:
-                cmd.extend(["-u", "origin", branch])
-            else:
-                cmd.extend(["origin", branch])
-
+        ref = (branch or "").strip()
+        if not ref:
+            valid, error = validate_project_root(project_root)
+            if not valid:
+                return ToolResult.fail(error)
             result = subprocess.run(
-                cmd, cwd=project_root, capture_output=True, text=True, timeout=60,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-            )
+                ["git", "branch", "--show-current"],
+                cwd=project_root, capture_output=True, text=True, timeout=10, env=git_env())
+            if result.returncode != 0 or not result.stdout.strip():
+                return ToolResult.fail(
+                    "Could not determine the current branch, so there is nothing to name in "
+                    "the push. Pass `branch` explicitly.")
+            ref = result.stdout.strip()
 
-            # Always strip token from remote after push
-            clean_url = f"https://github.com/{repo}.git"
-            subprocess.run(
-                ["git", "remote", "set-url", "origin", clean_url],
-                cwd=project_root, capture_output=True, text=True, timeout=5,
-                env=git_env(),
-            )
-
-            if result.returncode != 0:
-                stderr = result.stderr.lower()
-                if "authentication" in stderr or "403" in stderr:
-                    return ToolResult.fail("Push authentication failed — check GITHUB_TOKEN")
-                return ToolResult.fail(f"Push error: {sanitize_stderr(result.stderr)}")
-
-            return ToolResult.ok({
-                "repo": repo, "branch": branch, "pushed": True,
-                "output": sanitize_stderr(result.stderr.strip()),
-            })
-
-        except subprocess.TimeoutExpired:
-            try:
-                subprocess.run(
-                    ["git", "remote", "set-url", "origin", f"https://github.com/{repo}.git"],
-                    cwd=project_root, capture_output=True, timeout=5,
-                env=git_env(),
-            )
-            except Exception:
-                pass
-            return ToolResult.fail("Push timed out")
-        except Exception as e:
-            return ToolResult.fail(f"Push error: {sanitize_stderr(str(e))}")
+        ok, payload = await remote_op(
+            repo, "push", ref=ref, profile_slug=self._profile_slug,
+            ticket_hint=(kwargs.get("ticket") or "").strip())
+        if not ok:
+            return ToolResult.fail(str(payload))
+        return ToolResult.ok(payload)
