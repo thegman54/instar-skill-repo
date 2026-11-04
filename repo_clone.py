@@ -10,6 +10,61 @@ from ..registry import register_tool
 from .base import check_repo_access, git_env, sanitize_stderr
 
 
+# Documents a bot has no business reading, hidden from the WORKING TREE of every checkout the
+# fleet works in. Each pattern is a sparse-checkout exclusion, so the files stay tracked, stay
+# on the remote, stay in everyone else's clone and stay in git history — they are simply not
+# written to disk here.
+#
+# WHY. A repository accumulates write-ups of one past problem: CLAUDE_TROUBLESHOOTING_MYSORT.md,
+# CLAUDE_ASSET_TAGGING_INVESTIGATION.md, CLAUDE1.md. entity-feature-data-loaders has 36 of them
+# against 9 live notes files. They were accurate on the day they were written, nobody maintains
+# them, and a bot that greps the repo meets them as peers of the current document — which is how
+# a procedure from March gets followed in November. Their own manual spends its opening section
+# telling the reader which ones to ignore; that section exists because the files are reachable.
+#
+# WHY NOT MOVE OR DELETE THEM. Because they are not ours, they are useful to the person who
+# wrote them, and a repository's contents are not something the fleet gets to decide. This hides
+# them locally and ships nothing: the patterns live in .git/info/sparse-checkout, which is never
+# committed, so no other clone and no other person is affected.
+#
+# NOT EXCLUDED, deliberately: CLAUDE.md (the live working notes, which a bot opened in that repo
+# should read) and CLAUDEBOT*.md (written for a bot in the first place). Neither matches the
+# patterns below, which all require an underscore, a digit or a dash after CLAUDE.
+#
+# ANCHORS MUST NOT POINT AT AN EXCLUDED PATH. A knowledge anchor resolves with `git grep` in
+# this checkout, so a fact anchored to a hidden file is unresolvable here. Nothing anchors to
+# these today and nothing should: a claim about a stale document is not a claim about code.
+SPARSE_HIDE = (
+    "!CLAUDE_*.md", "!**/CLAUDE_*.md",          # CLAUDE_TROUBLESHOOTING_*, CLAUDE_*_INVESTIGATION
+    "!CLAUDE[0-9]*.md", "!**/CLAUDE[0-9]*.md",  # CLAUDE1.md and friends
+    "!CLAUDE-*.md", "!**/CLAUDE-*.md",          # CLAUDE-20250909-AssetManager-Progress.md
+)
+
+
+def apply_sparse_hide(workspace_path: str) -> dict:
+    """Hide the documents in SPARSE_HIDE from this checkout's working tree.
+
+    Idempotent, and safe on a dirty tree for the files it touches: sparse-checkout refuses to
+    drop a file with local modifications rather than discarding them. Reported rather than
+    raised — a checkout that exists with the documents still present is a working checkout, and
+    failing a clone over tidiness would be the wrong trade.
+    """
+    out = {}
+    init = subprocess.run(["git", "sparse-checkout", "init", "--no-cone"],
+                          cwd=workspace_path, capture_output=True, text=True, timeout=30,
+                          env=git_env())
+    if init.returncode != 0:
+        return {"sparse": "unavailable", "detail": sanitize_stderr(init.stderr)[:160]}
+    # "/*" first: include everything, then subtract. Order matters — a later pattern wins.
+    setr = subprocess.run(["git", "sparse-checkout", "set", "/*", *SPARSE_HIDE],
+                          cwd=workspace_path, capture_output=True, text=True, timeout=60,
+                          env=git_env())
+    if setr.returncode != 0:
+        return {"sparse": "failed", "detail": sanitize_stderr(setr.stderr)[:160]}
+    out["sparse"] = "applied"
+    return out
+
+
 @register_tool
 class RepoCloneTool(BaseTool):
     """Clone a GitHub repository into the shared workspace."""
@@ -96,6 +151,7 @@ class RepoCloneTool(BaseTool):
 
         self._configure_git(workspace_path)
         self._sanitize_remote(workspace_path, repo)
+        sparse = apply_sparse_hide(workspace_path)
         self._chown_workspace(workspace_path)
 
         info = self._get_repo_info(workspace_path)
@@ -103,6 +159,7 @@ class RepoCloneTool(BaseTool):
         return ToolResult.ok({
             "repo": repo,
             "action": "cloned",
+            **sparse,
             "path": workspace_path,
             **info,
         })
@@ -211,6 +268,9 @@ class RepoCloneTool(BaseTool):
 
         self._configure_git(workspace_path)
         self._sanitize_remote(workspace_path, repo)
+        # Also on pull, so a checkout made before this existed converges on the next sync
+        # instead of needing a re-clone.
+        apply_sparse_hide(workspace_path)
         self._chown_workspace(workspace_path)
 
         if pull_result.returncode != 0:
