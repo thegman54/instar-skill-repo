@@ -61,7 +61,17 @@ def apply_sparse_hide(workspace_path: str) -> dict:
                           env=git_env())
     if setr.returncode != 0:
         return {"sparse": "failed", "detail": sanitize_stderr(setr.stderr)[:160]}
-    out["sparse"] = "applied"
+    # `set` writes the patterns and is supposed to update the working tree with them. On the
+    # existing checkouts it wrote the patterns, reported success, and left every file on disk —
+    # measured, 31 before and 31 after. `reapply` then removed them. So the tree update is not
+    # something to assume from a zero exit status; it is asked for explicitly and its own
+    # status is what gets reported.
+    re = subprocess.run(["git", "sparse-checkout", "reapply"],
+                        cwd=workspace_path, capture_output=True, text=True, timeout=120,
+                        env=git_env())
+    out["sparse"] = "applied" if re.returncode == 0 else "patterns written, tree not updated"
+    if re.returncode != 0:
+        out["detail"] = sanitize_stderr(re.stderr)[:160]
     return out
 
 
