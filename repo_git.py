@@ -224,7 +224,12 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         return sanitize_stderr(text or "").replace(token, "***")
 
     if op == "fetch":
-        args = ["fetch", auth] + ([ref] if ref else ["--all"])
+        # `git fetch <url> --all` is rejected by git: --all means "every configured remote",
+        # which cannot be combined with naming one. Naming the authenticated URL with no
+        # refspec already fetches that remote's branches, which is what "fetch everything"
+        # means here — the local remotes deliberately carry no credential, so there is no
+        # other remote to include.
+        args = ["fetch", auth] + ([ref] if ref else [])
         r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
                            timeout=180, env=git_env())
         if r.returncode != 0:
