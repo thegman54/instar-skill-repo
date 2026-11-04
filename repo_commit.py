@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import git_env, check_repo_access, validate_path, validate_project_root
+from .base import git_env, git_identity, check_repo_access, validate_path, validate_project_root
 
 
 @register_tool
@@ -67,10 +67,11 @@ class RepoCommitTool(BaseTool):
                 return ToolResult.fail(f"Stage error: {stage_result.stderr}")
 
             full_message = f"{message}\n\nCo-Authored-By: Instar Bot <bot@instar.local>"
+            # Identity on the commit call only — staging and rev-parse do not need one.
             commit_result = subprocess.run(
                 ["git", "commit", "-m", full_message],
                 cwd=project_root, capture_output=True, text=True, timeout=30,
-                env=git_env(),
+                env=git_env(git_identity(self._profile_slug)),
             )
             if commit_result.returncode != 0:
                 if "nothing to commit" in commit_result.stdout.lower():

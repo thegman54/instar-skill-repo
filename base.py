@@ -47,6 +47,27 @@ GIT_SAFE_ENV = {
 }
 
 
+def git_identity(profile_slug: str = "") -> dict:
+    """Author/committer identity for a commit, as environment rather than config.
+
+    Git refuses to commit without one, and nothing in these containers sets it, so every
+    commit through this skill failed with "Author identity unknown" — the last step of the
+    write path, reached only after a branch and a file edit had already succeeded.
+
+    The identity names the PROFILE that committed, because a commit whose author is a
+    generic service account is a commit nobody can trace back to the bot that wrote it.
+    Set via GIT_* env for the same reason as safe.directory: it cannot drift, and it cannot
+    be written into a checkout the bots push from.
+    """
+    slug = (profile_slug or "").strip() or "instar-bot"
+    name = slug
+    email = f"{slug}@bots.instar.local"
+    return {
+        "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+        "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email,
+    }
+
+
 def git_env(extra: dict = None) -> dict:
     """Environment for any git subprocess in this skill.
 
