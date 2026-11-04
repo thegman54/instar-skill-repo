@@ -19,7 +19,13 @@ class RepoBranchTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Manage git branches. Can list all branches, create a new branch, or switch to an existing branch."
+        return (
+            "List branches, create one, or switch to one.\n\n"
+            "For work on a ticket, pass `ticket` and leave `name` empty: the branch is the "
+            "one the coordinator named when it raised the work unit, and that is the only "
+            "ref the push gate will accept. Composing a name yourself is how you end up with "
+            "a branch that cannot be published."
+        )
 
     @property
     def input_schema(self) -> dict:
@@ -28,7 +34,12 @@ class RepoBranchTool(BaseTool):
             "properties": {
                 "repo": {"type": "string", "description": "Repository in owner/repo format"},
                 "action": {"type": "string", "enum": ["list", "create", "switch"], "description": "Action to perform (default: list)"},
-                "name": {"type": "string", "description": "Branch name (required for create/switch)"},
+                "name": {"type": "string",
+                         "description": "Branch name. Omit it and pass `ticket` instead for "
+                                        "work on a ticket — the coordinator already named it"},
+                "ticket": {"type": "string",
+                           "description": "Ticket key, e.g. CLC-4555. The branch name is read "
+                                          "from that ticket's open work unit for this repo"},
                 "from_branch": {"type": "string", "description": "Base branch to create from (default: current branch)"},
             },
             "required": ["repo"],
@@ -37,10 +48,41 @@ class RepoBranchTool(BaseTool):
     def credential_keys(self) -> list[str]:
         return []
 
-    async def execute(self, repo: str, action: str = "list", name: str = None, from_branch: str = None, **kwargs) -> ToolResult:
+    async def execute(self, repo: str, action: str = "list", name: str = None,
+                      from_branch: str = None, ticket: str = "", **kwargs) -> ToolResult:
         valid, project_root, access, error, _ = await check_repo_access(repo, "branch", self._profile_slug)
         if not valid:
             return ToolResult.fail(error)
+
+        # THE NAME IS TOLD, NOT COMPOSED. A ticket resolves to the branch its work unit
+        # names, so the expert never derives a ref -- it cannot pick the wrong namespace,
+        # and the name it builds on is the same one the push gate checks against. Every
+        # repo manual said `feat/<TICKET>` while the gate publishes `bot/<TICKET>` only;
+        # reading the name removes that disagreement instead of restating it.
+        ticket = (ticket or "").strip()
+        if ticket:
+            from .repo_git import _units
+            n, named = await _units(repo.split("/")[-1], ticket)
+            if n < 0:
+                return ToolResult.fail(
+                    "Cannot reach the database to look up the branch for "
+                    f"{ticket}. Refusing rather than guessing a name.")
+            if n == 0:
+                return ToolResult.fail(
+                    f"No open work unit for {ticket} in this repo, so no branch has been "
+                    "named for it. Ask the coordinator for the unit rather than inventing "
+                    "a branch -- the push gate refuses a ref that matches no unit.")
+            if not named:
+                return ToolResult.fail(
+                    f"The open unit for {ticket} does not name a branch (it predates the "
+                    "coordinator naming them). Ask the coordinator to set it, so the name "
+                    "you build on is the name the gate checks.")
+            if name and name != named:
+                return ToolResult.fail(
+                    f"{ticket}'s branch is {named!r}, not {name!r}. Omit `name` and let the "
+                    "unit answer, or raise the disagreement -- do not create a second branch "
+                    "for one unit.")
+            name = named
 
         valid, error = validate_project_root(project_root)
         if not valid:

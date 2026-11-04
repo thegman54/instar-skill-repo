@@ -66,8 +66,11 @@ REF_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
 FLEET_API = os.environ.get("FLEET_API", "http://gatekeeper:8090")
 
 
-async def _units(repo_slug: str, ticket: str) -> int:
-    """Open work units for this repo and ticket, straight from the database.
+async def _units(repo_slug: str, ticket: str) -> tuple:
+    """Open work units for this repo and ticket, and the branch the coordinator named.
+
+    Returns (count, named_branch). count is -1 for "could not ask", which the caller must
+    fail closed on; named_branch is "" for a unit raised before branches were named.
 
     NOT over the fleet's HTTP API, which is how this was written first and why it returned
     502. The call arrives here via the gatekeeper's proxy, so asking the gatekeeper a question
@@ -78,13 +81,19 @@ async def _units(repo_slug: str, ticket: str) -> int:
     from ...db import get_pool
     pool = get_pool()
     if not pool:
-        return -1          # unknown, not zero — the caller must fail closed on this
+        return -1, ""      # unknown, not zero — the caller must fail closed on this
     async with pool.acquire() as conn:
-        return await conn.fetchval(
-            """SELECT count(*) FROM fleet_work_units
+        rows = await conn.fetch(
+            """SELECT COALESCE(branch, '') AS branch FROM fleet_work_units
                 WHERE upper(parent_key) = upper($1) AND repo_slug = $2
-                  AND state <> ALL($3::text[])""",
+                  AND state <> ALL($3::text[])
+                ORDER BY created_at""",
             ticket, repo_slug, ["done", "cancelled", "declined"])
+    # The named branch comes back with the count because the two answers are one question:
+    # "is this ref the work that was assigned". A count alone let any bot/<TICKET> spelling
+    # through, which is how a manual that said feat/ went unnoticed for so long.
+    named = next((r["branch"] for r in rows if r["branch"]), "")
+    return len(rows), named
 
 
 async def _release_member(repo_slug: str, group_key: str) -> int:
@@ -115,7 +124,7 @@ async def may_push(repo: str, ref: str) -> tuple:
         if not TICKET_RE.match(ticket):
             return False, (f"{ref!r} is in the bot namespace but {ticket!r} is not a ticket "
                            "key. Branches are named bot/<TICKET>, e.g. bot/CLC-4156.")
-        n = await _units(repo_slug, ticket)
+        n, named = await _units(repo_slug, ticket)
         if n < 0:
             # Fails CLOSED, the same rule the promotion check follows: a gate that cannot
             # confirm it is allowed is not allowed.
@@ -125,7 +134,19 @@ async def may_push(repo: str, ref: str) -> tuple:
             return False, (f"no open work unit for {ticket} in {repo_slug}, so {ref} is not "
                            "work the coordinator asked for. Branches carry assigned work; one "
                            "matching no unit is untraceable by design.")
-        return True, f"open work unit for {ticket} in {repo_slug}"
+        # The unit NAMES its branch, so the ref is checked against that name rather than
+        # merely against the ticket. Without this, every spelling under bot/<TICKET> passed
+        # the same check and the expert was trusted to derive a name it had no reliable
+        # source for — which is exactly how a repo manual saying `feat/` stayed invisible.
+        # A unit raised before branches were named carries no name; those still pass on the
+        # ticket alone rather than becoming unpushable.
+        if named and ref != named:
+            return False, (f"this unit's branch is {named!r}, not {ref!r}. The coordinator "
+                           "names the branch when it raises the work; use the name it gave "
+                           "rather than composing one, and if that name looks wrong say so "
+                           "instead of pushing a different ref.")
+        return True, (f"open work unit for {ticket} in {repo_slug}"
+                      + (f", branch named {named}" if named else ""))
 
     if ref.startswith(RELEASE_PREFIX):
         group_key = ref[len(RELEASE_PREFIX):]
