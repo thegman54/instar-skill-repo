@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import git_env, check_repo_access, validate_project_root
+from .base import git_env, check_repo_access, sanitize_stderr, validate_project_root
 
 
 @register_tool
@@ -64,11 +64,17 @@ class RepoBranchTool(BaseTool):
                 cmd = ["git", "checkout", "-b", name]
                 if from_branch:
                     cmd.append(from_branch)
-                result = subprocess.run(cmd, cwd=project_root, capture_output=True, text=True, timeout=30)
+                # env=git_env() like every other git call in this skill. This one was the
+                # single exception, so it inherited an environment without GIT_SAFE_ENV and
+                # died on "dubious ownership" against any workspace clone chowned to uid
+                # 1000 for the expert-runner — which is all of them. Creating a branch is
+                # the first thing an expert does, so the whole write path ended here.
+                result = subprocess.run(cmd, cwd=project_root, capture_output=True,
+                                        text=True, timeout=30, env=git_env())
                 if result.returncode != 0:
                     if "already exists" in result.stderr.lower():
                         return ToolResult.fail(f"Branch '{name}' already exists")
-                    return ToolResult.fail(f"Git error: {result.stderr}")
+                    return ToolResult.fail(f"Git error: {sanitize_stderr(result.stderr)}")
                 return ToolResult.ok({"action": "created", "branch": name, "from": from_branch or "(current branch)"})
 
             elif action == "switch":
