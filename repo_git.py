@@ -246,11 +246,25 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
 
     if op == "fetch":
         # `git fetch <url> --all` is rejected by git: --all means "every configured remote",
-        # which cannot be combined with naming one. Naming the authenticated URL with no
-        # refspec already fetches that remote's branches, which is what "fetch everything"
-        # means here — the local remotes deliberately carry no credential, so there is no
-        # other remote to include.
-        args = ["fetch", auth] + ([ref] if ref else [])
+        # which cannot be combined with naming one.
+        #
+        # AN EXPLICIT REFSPEC IS LOAD-BEARING, and its absence was a silent defect. Fetching a
+        # URL rather than a named remote carries no configured refspec, so git writes
+        # FETCH_HEAD and updates NO remote-tracking ref. `origin/<branch>` therefore never
+        # moved, no matter how many times anything fetched: the testbed's `origin/production`
+        # sat at the clone's commit while the remote was a commit ahead, and `git-gate sync`
+        # read that stale ref and reported the checkout current. Everything downstream
+        # inherited it — "is this commit published" compared against a ref frozen at clone
+        # time, so pushed work read as unpushed.
+        #
+        # Forced (`+`) because these refs mirror the remote and are never edited locally;
+        # a non-fast-forward there means the remote branch moved, which is the case this
+        # exists to notice.
+        remote_name = (subprocess.run(["git", "-C", path, "remote"], capture_output=True,
+                                      text=True, timeout=30).stdout.split() or ["origin"])[0]
+        refspec = (f"+refs/heads/{ref}:refs/remotes/{remote_name}/{ref}" if ref
+                   else f"+refs/heads/*:refs/remotes/{remote_name}/*")
+        args = ["fetch", auth, refspec]
         r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
                            timeout=180, env=git_env())
         if r.returncode != 0:
