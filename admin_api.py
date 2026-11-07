@@ -180,6 +180,10 @@ async def check_access(pool, body=None, repo_name=None, **kw):
 async def git_remote(pool, body=None, **kw):
     """Remote git for a caller that holds no credential — git-gate's only way to a remote.
 
+    `pr` is reachable here and NOT through the repo_git MCP tool, deliberately. The gate
+    decides when a pull request is opened and against what, under rules a bot cannot reach
+    around; exposing it as a tool would let a bot open one directly and skip them.
+
     Shares `remote_op` with the MCP tool rather than re-implementing the rules, because a
     security check written twice becomes two checks, and the one nobody is reading is the one
     that stays permissive.
@@ -201,8 +205,15 @@ async def git_remote(pool, body=None, **kw):
 
     from .repo_git import remote_op
     try:
+        # base/title/body/draft are only meaningful to `pr`; the other ops ignore them. Passed
+        # through rather than special-cased here, because this route's job is to carry the
+        # request to the one place that decides what any of it means.
         ok, payload = await remote_op(repo, op, ref, profile_slug,
-                                      ticket_hint=(body.get("ticket") or "").strip())
+                                      ticket_hint=(body.get("ticket") or "").strip(),
+                                      base=(body.get("base") or "").strip(),
+                                      title=(body.get("title") or ""),
+                                      body=(body.get("pr_body") or ""),
+                                      draft=bool(body.get("draft")))
     except Exception as exc:
         log.warning("git_remote_failed", repo=repo, op=op, ref=ref, error=str(exc)[:200])
         return {"ok": False, "error": f"{op} failed: {str(exc)[:300]}"}

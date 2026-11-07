@@ -42,6 +42,8 @@ import json
 import os
 import re
 import subprocess
+import urllib.error
+import urllib.parse
 import urllib.request
 
 import structlog
@@ -195,14 +197,16 @@ async def _record(repo: str, op: str, ref: str, decision: str, reason: str,
 
 
 async def remote_op(repo: str, op: str, ref: str = "", profile_slug: str = "",
-                    token: str = None, ticket_hint: str = "") -> tuple:
+                    token: str = None, ticket_hint: str = "", base: str = "",
+                    title: str = "", body: str = "", draft: bool = False) -> tuple:
     """Validate, perform, and RECORD one remote operation. Returns (ok, payload_or_reason).
 
     Recording happens here, around the whole decision, rather than at each return. A dozen
     exits each responsible for remembering to log is a design where one of them eventually
     does not, and the one that forgets is never the boring one.
     """
-    ok, payload = await _decide(repo, op, ref, profile_slug, token, ticket_hint)
+    ok, payload = await _decide(repo, op, ref, profile_slug, token, ticket_hint,
+                                base, title, body, draft)
     if ok:
         why = payload.get("why_allowed") or f"{op} performed"
         await _record(repo, op, ref, "allowed", why, profile_slug)
@@ -216,10 +220,11 @@ async def remote_op(repo: str, op: str, ref: str = "", profile_slug: str = "",
 
 
 async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
-                  token: str = None, ticket_hint: str = "") -> tuple:
+                  token: str = None, ticket_hint: str = "", base: str = "",
+                  title: str = "", body: str = "", draft: bool = False) -> tuple:
     """The decision itself, with no knowledge of how it gets recorded."""
-    if op not in ("fetch", "push", "promote"):
-        return False, f"unknown op {op!r} — expected fetch, push or promote"
+    if op not in ("fetch", "push", "promote", "pr"):
+        return False, f"unknown op {op!r} — expected fetch, push, promote or pr"
 
     valid, path, _access, error, _branch = await check_repo_access(
         repo, "read" if op == "fetch" else "push", profile_slug)
@@ -272,6 +277,118 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         return True, {"repo": repo, "op": "fetch", "ref": ref or "(all)",
                       "output": scrub(r.stderr or r.stdout)[-600:]}
 
+
+    # ---------------------------------------------------------------- pr
+    #
+    # WHY THIS IS HERE AT ALL, 2026-11-07. Creating a pull request was the one remote
+    # operation that never moved. On 2026-09-23 the GitHub credential was taken out of the
+    # expert-runner container and put here, in the same process as the ref check, because a
+    # credential helper in that container meant these rules were advice `git push` ignored.
+    # fetch, push and promote came with it; `gh pr create` stayed behind, shelling out in a
+    # container that from then on had no credential and no `gh` login. It therefore failed
+    # every time -- not only for `git-gate pr staging`, but for the DRAFT PR that every push
+    # tries to open, which is the artifact a person is supposed to read before approving a
+    # promotion. The promote button had no diff beside it, and the only trace was a warning
+    # on stderr that nothing collected.
+    #
+    # OPENING A PR NEEDS NO FLEET APPROVAL, unlike promote. A pull request is a REQUEST for
+    # review; it changes no environment and merging it is a human act performed in GitHub.
+    # Requiring an approval to ask for one would invert the order the whole flow depends on:
+    # the PR is the thing the approval is granted ON.
+    #
+    # The REST API rather than `gh`: this process holds the token and must not hand it to a
+    # subprocess environment, and nothing here should depend on a CLI being installed and
+    # logged in. One POST, one documented response shape.
+    if op == "pr":
+        if not ref:
+            return False, "pr needs a head ref — name the branch to open the request from"
+        base = (base or "").strip()
+        if not base:
+            return False, "pr needs a base — the branch the request is opened against"
+        if not REF_RE.match(base):
+            return False, f"{base!r} is not a usable branch name"
+
+        # The head is held to the SAME rule as push: a pull request from a branch that is not
+        # traceable work is not something this path opens, and a branch that was never
+        # pushable cannot have reached the remote to be PR'd anyway.
+        if ref in NEVER or ref.split("/")[-1] in NEVER:
+            return False, (f"{ref} is an environment branch; a pull request is opened FROM "
+                           "work and INTO an environment, not the other way round.")
+        allowed, why = await may_push(repo, ref)
+        if not allowed:
+            return False, why
+
+        # And the base must BE an environment. This path exists to reach staging and
+        # production by review; a PR between two ordinary branches is not its business and
+        # would be a way to route work somewhere nobody is watching.
+        if base not in NEVER:
+            return False, (f"{base!r} is not an environment branch. A pull request here is "
+                           "how work reaches an environment for a person to merge.")
+
+        owner = repo.split("/")[0]
+        api = f"https://api.github.com/repos/{repo}/pulls"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "instar-repo-git",
+            "Content-Type": "application/json",
+        }
+
+        def _api(url, data=None, method="GET"):
+            req = urllib.request.Request(
+                url, data=(json.dumps(data).encode() if data is not None else None),
+                headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, json.loads(r.read().decode() or "null")
+
+        payload = {
+            "title": (title or f"{ticket_hint or ref}: {ref}")[:250],
+            "head": ref,
+            "base": base,
+            "body": (body or "Opened by the repo expert gate. Merging is a human "
+                             "decision.")[:60000],
+            "draft": bool(draft),
+        }
+        try:
+            _status, created = _api(api, payload, "POST")
+            log.info("repo_git_pr", repo=repo, ref=ref, base=base,
+                     number=created.get("number"), draft=bool(draft))
+            return True, {"repo": repo, "op": "pr", "ref": ref, "base": base,
+                          "url": created.get("html_url", ""),
+                          "number": created.get("number"), "existing": False,
+                          "why_allowed": why}
+        except urllib.error.HTTPError as err:
+            detail = ""
+            try:
+                detail = err.read().decode()[:600]
+            except Exception:                                           # noqa: BLE001
+                pass
+            # ALREADY OPEN IS NOT A FAILURE. Re-running the flow -- which the gate does on
+            # every push -- must not break because the request it would create is already
+            # there. GitHub answers 422 for that, so the existing one is looked up and
+            # returned, making this idempotent rather than merely tolerant.
+            if err.code == 422 and "pull request already exists" in detail.lower():
+                try:
+                    _s, found = _api(
+                        f"{api}?state=open&base={urllib.parse.quote(base)}"
+                        f"&head={urllib.parse.quote(owner + ':' + ref)}")
+                    if found:
+                        return True, {"repo": repo, "op": "pr", "ref": ref, "base": base,
+                                      "url": found[0].get("html_url", ""),
+                                      "number": found[0].get("number"), "existing": True,
+                                      "why_allowed": "a pull request was already open"}
+                except Exception as exc:                                # noqa: BLE001
+                    return False, (f"a pull request from {ref} into {base} already exists, "
+                                   f"and it could not be looked up ({scrub(str(exc))[:200]})")
+                return True, {"repo": repo, "op": "pr", "ref": ref, "base": base,
+                              "url": "", "number": None, "existing": True,
+                              "why_allowed": "a pull request was already open"}
+            return False, (f"opening a pull request from {ref} into {base} failed "
+                           f"({err.code}): {scrub(detail)[:400]}")
+        except Exception as exc:                                        # noqa: BLE001
+            return False, (f"opening a pull request from {ref} into {base} failed: "
+                           f"{scrub(str(exc))[:400]}")
 
     # ---------------------------------------------------------------- promote
     #
