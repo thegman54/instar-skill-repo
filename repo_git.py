@@ -113,8 +113,15 @@ async def _release_member(repo_slug: str, group_key: str) -> int:
             group_key, repo_slug)
 
 
-async def _eligible(repo_slug: str) -> int:
-    """1 if the fleet may write to this repo at all, 0 if not, -1 if unknowable.
+async def _eligible(repo_slug: str) -> str:
+    """Whether the fleet may write to this repo at all: yes | off | unregistered | unknown.
+
+    FOUR ANSWERS, NOT TWO, because the refusals are not the same refusal and a person reads
+    them to decide what to do. "off" is a decision someone made and can revisit on the
+    registry row; "unregistered" means the fleet has never been told this repository exists,
+    which is usually a wrong remote rather than a policy to change; "unknown" means the guard
+    could not ask. Collapsing them sent somebody looking for a flag to flip on a row that
+    was not there.
 
     WHY THIS IS HERE AND WAS NOT. `fleet_eligible` is the flag that answers "may the fleet
     touch this repository", and `fleet_unit.py` has always described it as bounding what an
@@ -135,18 +142,18 @@ async def _eligible(repo_slug: str) -> int:
     from ...db import get_pool
     pool = get_pool()
     if not pool:
-        return -1
+        return "unknown"
     async with pool.acquire() as conn:
         # to_regclass first: the repo skill can be installed without the fleet skill, and a
         # failed statement would abort the surrounding transaction and surface as something
         # unrelated. Absent table is unknowable, not permitted.
         if not await conn.fetchval("SELECT to_regclass('fleet_registry') IS NOT NULL"):
-            return -1
+            return "unknown"
         row = await conn.fetchrow(
             "SELECT fleet_eligible FROM fleet_registry WHERE repo_slug = $1", repo_slug)
     if row is None:
-        return 0
-    return 1 if row["fleet_eligible"] else 0
+        return "unregistered"
+    return "yes" if row["fleet_eligible"] else "off"
 
 
 async def may_push(repo: str, ref: str) -> tuple:
@@ -162,10 +169,16 @@ async def may_push(repo: str, ref: str) -> tuple:
     # "is this ref well formed" first would answer a narrower question than the one the flag
     # settles. Fails closed, the same rule every other check here follows.
     ok = await _eligible(repo_slug)
-    if ok < 0:
+    if ok == "unknown":
         return False, ("cannot read the fleet registry to confirm "
                        f"{repo_slug} may be written to. Refusing rather than assuming.")
-    if ok == 0:
+    if ok == "unregistered":
+        return False, (f"{repo_slug} has no fleet registry row, so the fleet has never been "
+                       "told this repository exists and nothing is pushed to it. Check the "
+                       "remote first — a typo or the wrong owner looks exactly like this. "
+                       "If the repository is real and the fleet should work it, a person "
+                       "adds the registry row.")
+    if ok == "off":
         return False, (f"{repo_slug} is not fleet-eligible, so nothing is pushed to it — not "
                        "a bot branch, not a release branch. An open work unit does not "
                        "override this: routing decides what work exists, eligibility decides "
