@@ -113,6 +113,42 @@ async def _release_member(repo_slug: str, group_key: str) -> int:
             group_key, repo_slug)
 
 
+async def _eligible(repo_slug: str) -> int:
+    """1 if the fleet may write to this repo at all, 0 if not, -1 if unknowable.
+
+    WHY THIS IS HERE AND WAS NOT. `fleet_eligible` is the flag that answers "may the fleet
+    touch this repository", and `fleet_unit.py` has always described it as bounding what an
+    expert can PUSH. It did not: nothing on any push path read it. The only reader was the
+    PROMOTION check, so an ineligible repo refused the pull request and accepted the branch —
+    and a `bot/<TICKET>` push was authorised on one condition, that an open work unit exists
+    for the ticket and repo. Units are created by routing, which is a separate decision from
+    eligibility, so two units on an ineligible repo were enough to make it pushable.
+
+    Found 2026-11-08, with two open units sitting on `cenora-core-data-services` and
+    `cenora-agency-links-api` — both marked ineligible precisely so the fleet would stay off
+    them. The branch push would have gone through.
+
+    A MISSING ROW IS A REFUSAL, not a default. A repo with no registry row is a repo the
+    fleet was never told about, and the one thing a guard must not do is treat "I have never
+    heard of this" as permission.
+    """
+    from ...db import get_pool
+    pool = get_pool()
+    if not pool:
+        return -1
+    async with pool.acquire() as conn:
+        # to_regclass first: the repo skill can be installed without the fleet skill, and a
+        # failed statement would abort the surrounding transaction and surface as something
+        # unrelated. Absent table is unknowable, not permitted.
+        if not await conn.fetchval("SELECT to_regclass('fleet_registry') IS NOT NULL"):
+            return -1
+        row = await conn.fetchrow(
+            "SELECT fleet_eligible FROM fleet_registry WHERE repo_slug = $1", repo_slug)
+    if row is None:
+        return 0
+    return 1 if row["fleet_eligible"] else 0
+
+
 async def may_push(repo: str, ref: str) -> tuple:
     """Whether this ref may be published, and why either way.
 
@@ -120,6 +156,22 @@ async def may_push(repo: str, ref: str) -> tuple:
     caller can write, and a guard the guarded party can edit is not a guard.
     """
     repo_slug = repo.split("/")[-1]
+
+    # BEFORE the namespace rules, because eligibility is not about the ref. A repo the fleet
+    # is not allowed to write to is not allowed a bot branch OR a release branch, and asking
+    # "is this ref well formed" first would answer a narrower question than the one the flag
+    # settles. Fails closed, the same rule every other check here follows.
+    ok = await _eligible(repo_slug)
+    if ok < 0:
+        return False, ("cannot read the fleet registry to confirm "
+                       f"{repo_slug} may be written to. Refusing rather than assuming.")
+    if ok == 0:
+        return False, (f"{repo_slug} is not fleet-eligible, so nothing is pushed to it — not "
+                       "a bot branch, not a release branch. An open work unit does not "
+                       "override this: routing decides what work exists, eligibility decides "
+                       "which repositories the fleet may write to at all, and they are "
+                       "separate decisions by design. A person flips fleet_eligible on the "
+                       "registry row; do not look for another way round it.")
 
     if ref.startswith(BOT_PREFIX):
         ticket = ref[len(BOT_PREFIX):]
