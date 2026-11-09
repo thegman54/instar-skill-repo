@@ -47,7 +47,7 @@ GIT_SAFE_ENV = {
 }
 
 
-def git_identity(profile_slug: str = "") -> dict:
+def git_identity(profile_slug: str = "", display_name: str = "") -> dict:
     """Author/committer identity for a commit, as environment rather than config.
 
     Git refuses to commit without one, and nothing in these containers sets it, so every
@@ -60,12 +60,40 @@ def git_identity(profile_slug: str = "") -> dict:
     be written into a checkout the bots push from.
     """
     slug = (profile_slug or "").strip() or "instar-bot"
-    name = slug
+    name = (display_name or "").strip() or slug
     email = f"{slug}@bots.instar.local"
     return {
         "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
         "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email,
     }
+
+
+async def git_author(profile_slug: str = "") -> dict:
+    """The same identity, with the NAME a person would recognise in a git log.
+
+    WHY THE NAME AND THE ADDRESS DISAGREE ON PURPOSE. These commits land in other teams'
+    repositories, where `fleet_cen_dev` is an internal slug that means nothing to the
+    reviewer reading the history. So the name is the profile's `display_name` -- the one
+    string a human already maintains for it in the admin UI -- and the address stays
+    `<slug>@bots.instar.local`, which is what makes a commit traceable back to exactly one
+    profile no matter how often somebody renames it. Rename freely; `git log --author` keeps
+    working, because it has the address to go on.
+
+    Falls back to the slug if the lookup fails. A commit must not fail over its byline.
+    """
+    slug = (profile_slug or "").strip()
+    display = ""
+    if slug:
+        try:
+            from ...db import get_pool                                 # noqa: PLC0415
+            pool = get_pool()
+            if pool:
+                async with pool.acquire() as conn:
+                    display = await conn.fetchval(
+                        "SELECT display_name FROM bot_profiles WHERE slug = $1", slug) or ""
+        except Exception as exc:                                       # noqa: BLE001
+            log.warning("git_author_lookup_failed", profile=slug, error=str(exc)[:200])
+    return git_identity(slug, display)
 
 
 def git_env(extra: dict = None) -> dict:
