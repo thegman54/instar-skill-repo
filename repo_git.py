@@ -329,6 +329,41 @@ async def _report_pr(repo: str, ref: str, base: str, url: str, profile_slug: str
     return ""
 
 
+async def _fleet_pr_text(repo: str, ref: str) -> tuple:
+    """(title, body) composed by the fleet for this unit, or ("", "") if it cannot say.
+
+    WHY THE CALLER DOES NOT WRITE THIS. The defaults below produced two real pull requests
+    titled "bot/CLC-4555: bot/CLC-4555" with the body "Opened by the repo expert gate",
+    because nothing was passed and nothing asked. A request to merge has to say what the
+    change is, what was proven about it, and what is still unchecked — and every one of
+    those facts belongs to the fleet already: the unit's summary with its fidelity, the gate
+    attestation and its sha, the changed files, the evidence recorded against the unit, the
+    sibling units, and whether any post-deploy operation is even declared for the repo.
+
+    A summary retyped by a model is a summary that drifts from the record, so this asks for
+    the rendered one. Best effort: a fleet that cannot answer leaves the defaults in place
+    rather than refusing to open the request.
+    """
+    ticket = ref[len(BOT_PREFIX):] if ref.startswith(BOT_PREFIX) else ""
+    if not ticket:
+        return "", ""
+    import json as _j
+    import urllib.request as _u
+    url = (FLEET_API + "/api/fleet/units/" + urllib.parse.quote(repo.split("/")[-1])
+           + "/" + urllib.parse.quote(ticket) + "/pr-body")
+    try:
+        raw = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _u.urlopen(url, timeout=15).read())
+        out = _j.loads(raw.decode() or "{}")
+    except Exception as exc:                                            # noqa: BLE001
+        log.warning("pr_body_unavailable", repo=repo, ticket=ticket, error=str(exc)[:200])
+        return "", ""
+    if out.get("error"):
+        log.info("pr_body_declined", repo=repo, ticket=ticket, why=out["error"][:160])
+        return "", ""
+    return (out.get("title") or ""), (out.get("body") or "")
+
+
 async def remote_op(repo: str, op: str, ref: str = "", profile_slug: str = "",
                     token: str = None, ticket_hint: str = "", base: str = "",
                     title: str = "", body: str = "", draft: bool = False) -> tuple:
@@ -506,6 +541,12 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
             with urllib.request.urlopen(req, timeout=60) as r:
                 return r.status, json.loads(r.read().decode() or "null")
 
+        # Composed from the record when the caller passes nothing, which is the normal
+        # case: the facts are the fleet's, not the caller's recollection.
+        if not (title and body):
+            _t, _b = await _fleet_pr_text(repo, ref)
+            title = title or _t
+            body = body or _b
         payload = {
             "title": (title or f"{ticket_hint or ref}: {ref}")[:250],
             "head": ref,
