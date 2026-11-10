@@ -13,6 +13,7 @@ from .repo_write import RepoWriteTool
 from .repo_grep import RepoGrepTool
 from .repo_status import RepoStatusTool
 from .repo_verify import RepoVerifyTool
+from .repo_preflight import RepoPreflightTool
 from .repo_diff import RepoDiffTool
 from .repo_commit import RepoCommitTool
 from .repo_push import RepoPushTool
@@ -34,6 +35,7 @@ __all__ = [
     'RepoGrepTool',
     'RepoStatusTool',
     'RepoVerifyTool',
+    'RepoPreflightTool',
     'RepoDiffTool',
     'RepoCommitTool',
     'RepoPushTool',
