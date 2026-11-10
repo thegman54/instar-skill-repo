@@ -157,6 +157,28 @@ async def _eligible(repo_slug: str) -> str:
     return "yes" if row["fleet_eligible"] else "off"
 
 
+async def _registered_expert(repo_slug: str) -> str:
+    """Which profile is the registered expert for this repo, or "" if it cannot be read.
+
+    Read from the registry, like every other rule here, so it is not something the caller
+    can assert about itself.
+    """
+    from ...db import get_pool
+    pool = get_pool()
+    if not pool:
+        return ""
+    try:
+        async with pool.acquire() as conn:
+            if not await conn.fetchval("SELECT to_regclass('fleet_registry') IS NOT NULL"):
+                return ""
+            return await conn.fetchval(
+                "SELECT profile_slug FROM fleet_registry WHERE repo_slug = $1",
+                repo_slug) or ""
+    except Exception as exc:                                            # noqa: BLE001
+        log.warning("registered_expert_lookup_failed", repo=repo_slug, error=str(exc)[:160])
+        return ""
+
+
 async def may_push(repo: str, ref: str) -> tuple:
     """Whether this ref may be published, and why either way.
 
@@ -428,6 +450,37 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         allowed, why = await may_push(repo, ref)
         if not allowed:
             return False, why
+
+        # AN EXPERT PUSHES BRANCHES. IT DOES NOT OPEN PULL REQUESTS.
+        #
+        # The division is the point of having two profiles: the expert works one repository
+        # and can attest its own build; the coordinator sees the ticket, the sibling units,
+        # the preflight against testing and what has to be run after a deploy, and is
+        # therefore the only party that can write a request a human can act on. An expert
+        # opening its own PR produces exactly what it produced on 2026-11-10 — title
+        # "bot/CLC-4555: bot/CLC-4555", body "Opened by the repo expert gate" — because it
+        # is being asked to summarise a decision it did not make.
+        #
+        # Checked here rather than left to the tool belt because repo_git is ONE tool and
+        # both profiles hold it: the expert needs fetch and push from the same surface.
+        # Exposing the pr op on 2026-11-10 therefore handed the expert a capability the
+        # belts had deliberately withheld — the coordinator carries repo_pr and repo_push,
+        # the expert carries neither — and it opened two requests within minutes.
+        #
+        # Unknown does not pass. If the registry cannot be read, nobody is named as the
+        # expert and this cannot tell whether the caller is it.
+        expert = await _registered_expert(repo.split("/")[-1])
+        if not expert:
+            return False, ("cannot read which profile is the registered expert for "
+                           f"{repo.split('/')[-1]}, so whether you are allowed to open this "
+                           "request cannot be decided. Refusing rather than assuming.")
+        if profile_slug and profile_slug == expert:
+            return False, (
+                f"{profile_slug} is the registered expert for {repo.split('/')[-1]}, and an "
+                "expert pushes branches rather than opening pull requests. Push the branch "
+                "and say it is ready; the coordinator opens the request, because the body "
+                "has to say how to test it and what to run afterwards — which needs the "
+                "ticket, the sibling units and the preflight, none of which you can see.")
 
         # And the base must BE an environment. This path exists to reach staging and
         # production by review; a PR between two ordinary branches is not its business and
