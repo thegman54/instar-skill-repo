@@ -189,18 +189,46 @@ class RepoVerifyTool(BaseTool):
         attested = await _attestation(repo, self._profile_slug or "")
 
         if proc.returncode != 0:
+            # A NON-ZERO EXIT IS NOT AUTOMATICALLY A FAILED BUILD, and saying so was this
+            # tool's first bug. git-gate raises Refused for a failed verify AND for every
+            # precondition it declines on — no policy, no open unit, an unreachable fleet —
+            # and they all leave the same exit code. The first real use hit a gate-to-fleet
+            # timeout and was told "the build or the tests failed", which is a different
+            # problem with a different owner, and the expert had to argue with its own tool
+            # to get back to the truth. So read what it SAID, not just how it exited: a
+            # verify that actually ran prints a `verify:` line per command.
+            ran = "[git-gate] verify:" in out
+            failed_build = "verify failed" in out or "verify failed" in err
+            refused = "REFUSED" in out or "REFUSED" in err
+            if failed_build:
+                meaning = (
+                    "The build or the tests failed, which IS an answer about the work — not a "
+                    "tool problem and not something to route around. Fix what failed and run "
+                    "this again, or move the unit to needs_input naming the command that "
+                    "failed. Do not ask for awaiting_qa; it will be refused, correctly.")
+            elif refused:
+                meaning = (
+                    "NOTHING WAS BUILT OR TESTED. The gate declined before running anything, "
+                    "so this says nothing about your code — read its refusal above, it names "
+                    "the reason. If that reason is about reaching the fleet, a policy, or an "
+                    "open unit, it is a platform or setup fault: escalate it as that, and do "
+                    "not report it as a test result. Your unit is unchanged.")
+            else:
+                meaning = (
+                    "The gate exited %d without a recognisable verdict and without printing a "
+                    "verify step, so it is unknown whether anything ran. Treat this as "
+                    "unobserved rather than as a pass or a failure, and escalate the output "
+                    "above." % proc.returncode)
             return ToolResult.ok({
                 "passed": False,
+                "commands_ran": ran,
+                "verdict": ("build_or_tests_failed" if failed_build else
+                            "refused_before_running" if refused else "unrecognised"),
                 "exit_code": proc.returncode,
                 "output": out,
                 "error": err,
                 "attestation": attested,
-                "what_this_means": (
-                    "The build or the tests failed, which IS an answer about the work — it is "
-                    "not a tool problem and not something to route around. Fix what failed "
-                    "and run this again, or move the unit to needs_input and say exactly "
-                    "which command failed. Do not ask for awaiting_qa; it will be refused, "
-                    "correctly."),
+                "what_this_means": meaning,
             })
 
         return ToolResult.ok({
