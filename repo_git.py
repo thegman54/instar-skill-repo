@@ -38,6 +38,7 @@ ONE IMPLEMENTATION, TWO CALLERS. The MCP tool and the HTTP route git-gate calls 
 versions, and the copy nobody is reading is the one that stays permissive.
 """
 
+import asyncio
 import json
 import os
 import re
@@ -261,6 +262,51 @@ async def _record(repo: str, op: str, ref: str, decision: str, reason: str,
         log.warning("repo_git_record_failed", repo=repo, op=op, error=str(exc)[:200])
 
 
+async def _report_pr(repo: str, ref: str, base: str, url: str, profile_slug: str) -> str:
+    """Tell the fleet which PR this unit now holds. Returns "" or why it did not.
+
+    WHY THIS HAS TO HAPPEN HERE. The landing poll — the only thing that moves a delivery
+    rung — reads units where testing_pr/staging_pr/prod_pr is set. It does NOT discover
+    pull requests; it refreshes the ones a unit already names. So a PR that is opened and
+    not reported is invisible for ever: the ladder stays dark, nobody can tell whether the
+    work landed, and the unit looks untouched. Measured on CLC-4555, where the branches were
+    pushed and nothing could say so.
+
+    `git-gate pr` has always reported, and its own endpoint's docstring says why it belongs
+    in the same operation that created the request: "a coordinator doing it as a second tool
+    call can forget the second call, and the panel would then offer a promote button beside
+    a branch with no diff to read." This path was added later and never did it.
+
+    Best effort, like report_gate: a PR that exists must not be rolled back because the
+    fleet was unreachable. The failure is returned so the caller can say it out loud rather
+    than let it pass as success.
+    """
+    ticket = ref[len(BOT_PREFIX):] if ref.startswith(BOT_PREFIX) else ""
+    if not (ticket and url):
+        return "no ticket in the ref, or no url" if not ticket else "the PR has no url"
+    # The fleet names targets by environment, not by branch. A base that is not an
+    # environment branch is a legitimate PR and simply has no rung to move.
+    target = {"testing": "testing", "staging": "staging",
+              "production": "prod", "prod": "prod", "master": "", "main": ""}.get(base, "")
+    if not target:
+        return ""
+    import json as _j
+    import urllib.request as _u
+    body = _j.dumps({"repo_slug": repo.split("/")[-1], "parent_key": ticket,
+                     "target": target, "url": url}).encode()
+    req = _u.Request(FLEET_API + "/api/fleet/units/pr", data=body,
+                     headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _u.urlopen(req, timeout=10).read())
+    except Exception as exc:                                            # noqa: BLE001
+        log.warning("repo_git_pr_report_failed", repo=repo, ticket=ticket,
+                    target=target, error=str(exc)[:200])
+        return f"{type(exc).__name__}: {str(exc)[:160]}"
+    log.info("repo_git_pr_reported", repo=repo, ticket=ticket, target=target)
+    return ""
+
+
 async def remote_op(repo: str, op: str, ref: str = "", profile_slug: str = "",
                     token: str = None, ticket_hint: str = "", base: str = "",
                     title: str = "", body: str = "", draft: bool = False) -> tuple:
@@ -419,9 +465,13 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
             _status, created = _api(api, payload, "POST")
             log.info("repo_git_pr", repo=repo, ref=ref, base=base,
                      number=created.get("number"), draft=bool(draft))
+            reported = await _report_pr(repo, ref, base, created.get("html_url", ""),
+                                        profile_slug)
             return True, {"repo": repo, "op": "pr", "ref": ref, "base": base,
                           "url": created.get("html_url", ""),
                           "number": created.get("number"), "existing": False,
+                          "reported_to_fleet": not reported,
+                          "report_error": reported,
                           "why_allowed": why}
         except urllib.error.HTTPError as err:
             detail = ""
@@ -439,9 +489,15 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
                         f"{api}?state=open&base={urllib.parse.quote(base)}"
                         f"&head={urllib.parse.quote(owner + ':' + ref)}")
                     if found:
+                        # Reported on the idempotent path too: the first attempt may have
+                        # created the PR and failed to report it, and this is the retry.
+                        reported = await _report_pr(
+                            repo, ref, base, found[0].get("html_url", ""), profile_slug)
                         return True, {"repo": repo, "op": "pr", "ref": ref, "base": base,
                                       "url": found[0].get("html_url", ""),
                                       "number": found[0].get("number"), "existing": True,
+                                      "reported_to_fleet": not reported,
+                                      "report_error": reported,
                                       "why_allowed": "a pull request was already open"}
                 except Exception as exc:                                # noqa: BLE001
                     return False, (f"a pull request from {ref} into {base} already exists, "
