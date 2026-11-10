@@ -85,14 +85,20 @@ dirty = subprocess.run(["git", "status", "--porcelain"],
 out.update({"branch": branch, "branch_sha": head[:12], "testing_branch": testing,
             "uncommitted_changes": bool(dirty)})
 
-f = run(["git", "fetch", remote, testing])
-out["steps"].append(f)
-if f["exit"] != 0:
-    out["error"] = "could not fetch " + testing
-    print(json.dumps(out)); sys.exit(0)
-
-tip = subprocess.run(["git", "rev-parse", remote + "/" + testing],
+# NO FETCH HERE. The GitHub credential was deliberately removed from this container (see
+# repo_git: every network git operation became a tool call in the executor, which holds the
+# token), so a fetch from in here dies with "could not read Username for github.com". The
+# executor has already fetched through remote_op, which writes refs/remotes/<remote>/<ref>
+# into this same .git — so the ref below is current and this process touches no network.
+remote_name = (subprocess.run(["git", "remote"], capture_output=True, text=True)
+               .stdout.split() or [remote])[0]
+tip = subprocess.run(["git", "rev-parse", remote_name + "/" + testing],
                      capture_output=True, text=True).stdout.strip()
+if not tip:
+    out["error"] = ("no local ref for " + remote_name + "/" + testing + ". The executor's "
+                    "fetch should have written it; without it there is nothing to merge "
+                    "against and guessing a base would be worse than refusing.")
+    print(json.dumps(out)); sys.exit(0)
 out["testing_sha"] = tip[:12]
 
 # Already contained? Then there is nothing to land and nothing to decide.
@@ -155,6 +161,31 @@ print(json.dumps(out))
 '''
 
 
+# The branch policies are mounted into this container too, at the deploy target's path.
+# Read here rather than asked of the runner because the fetch needs the branch name BEFORE
+# anything is executed over there.
+POLICY_DIR = os.environ.get(
+    "REPO_POLICY_DIR", "/app/tools/repo_expert_runtime/expert-runner/policy")
+
+
+def _testing_branch(repo: str) -> tuple:
+    """(branch, error). The policy is the only thing that may say which branch deploys."""
+    import json as _j
+    path = os.path.join(POLICY_DIR, repo.split("/")[-1] + ".json")
+    if not os.path.isfile(path):
+        return "", (f"no branch policy for {repo} at {path}, so there is no way to know "
+                    "which branch is testing. Guessing is how work lands on the wrong "
+                    "environment; ask an operator to add the policy.")
+    try:
+        pol = _j.load(open(path))
+    except Exception as exc:                                           # noqa: BLE001
+        return "", f"the branch policy for {repo} could not be read: {exc}"
+    branch = (pol.get("testing_branch") or "").strip()
+    if not branch:
+        return "", f"the branch policy for {repo} names no testing_branch"
+    return branch, ""
+
+
 async def _runner_for(profile_slug: str) -> str:
     if not profile_slug:
         return DEFAULT_RUNNER
@@ -214,6 +245,23 @@ class RepoPreflightTool(BaseTool):
         valid, error = validate_project_root(project_root)
         if not valid:
             return ToolResult.fail(error)
+
+        # THE FETCH HAPPENS HERE, not in the runner. The credential lives in this process
+        # and nowhere else, and remote_op is the single implementation of a remote git
+        # operation plus its ref rules — a second one here would be the copy that drifts.
+        # It writes refs/remotes/<remote>/<branch> into the shared .git, which is what the
+        # script then reads.
+        testing_branch, policy_err = _testing_branch(repo)
+        if policy_err:
+            return ToolResult.fail(policy_err)
+        from .repo_git import remote_op
+        ok, payload = await remote_op(repo, "fetch", ref=testing_branch,
+                                      profile_slug=self._profile_slug or "")
+        if not ok:
+            return ToolResult.fail(
+                f"could not fetch {testing_branch}: {payload}. Nothing was merged and "
+                "nothing was recorded; without the current tip there is nothing honest to "
+                "compare against.")
 
         runner = await _runner_for(self._profile_slug or "")
         cmd = ["docker", "exec", "-i", "-u", RUNNER_USER, runner,
