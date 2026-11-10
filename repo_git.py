@@ -598,7 +598,8 @@ class RepoGitTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Perform a remote git operation on a repository you own: `fetch` or `push`.\n\n"
+            "Perform a remote git operation on a repository you own: `fetch`, `push` or "
+            "`pr`.\n\n"
             "This is the ONLY path to a remote. Your container has no credential, so a plain "
             "`git push` cannot authenticate — that is deliberate, not a misconfiguration.\n\n"
             "What is allowed:\n"
@@ -607,6 +608,9 @@ class RepoGitTool(BaseTool):
             "  push release/<KEY>   — only if this repo is a member of that release group\n\n"
             "Always refused: environment branches (production, testing, staging, main), "
             "deleting any ref, and force-pushing anything but a release branch.\n\n"
+            "  pr                   — open a pull request from a branch you pushed into "
+            "another branch. Opening is allowed; MERGING stays a human decision, and the "
+            "fleet records the request so a delivery rung can observe it landing.\n\n"
             "Promotion to an environment is NOT done here. It goes through the fleet's "
             "approval, which fails closed.\n\n"
             "A refusal is an answer, not an error to route around. It names the rule that "
@@ -615,7 +619,7 @@ class RepoGitTool(BaseTool):
 
     @property
     def short_description(self) -> str:
-        return "Fetch or push, with server-side ref rules"
+        return "Fetch, push or open a pull request, with server-side ref rules"
 
     @property
     def input_schema(self) -> dict:
@@ -624,10 +628,19 @@ class RepoGitTool(BaseTool):
             "properties": {
                 "repo": {"type": "string",
                          "description": "owner/repo, e.g. cenora-llc/cenora-core-data-services"},
-                "op": {"type": "string", "enum": ["fetch", "push"]},
+                "op": {"type": "string", "enum": ["fetch", "push", "pr"]},
                 "ref": {"type": "string",
                         "description": "Branch to push, e.g. bot/CLC-4156. For fetch, the "
-                                       "branch to fetch (optional; defaults to all)."},
+                                       "branch to fetch (optional; defaults to all). For "
+                                       "pr, the HEAD branch the request comes from."},
+                "base": {"type": "string",
+                         "description": "pr only: the branch to merge INTO, e.g. testing. "
+                                        "Opening the request is allowed; merging it stays a "
+                                        "human decision."},
+                "title": {"type": "string", "description": "pr only: the request's title."},
+                "body": {"type": "string", "description": "pr only: the request's body."},
+                "draft": {"type": "boolean",
+                          "description": "pr only: open it as a draft. Default false."},
             },
             "required": ["repo", "op"],
         }
@@ -635,7 +648,17 @@ class RepoGitTool(BaseTool):
     def credential_keys(self) -> list[str]:
         return ["GITHUB_TOKEN"]
 
-    async def execute(self, repo: str, op: str, ref: str = "", **kwargs) -> ToolResult:
+    async def execute(self, repo: str, op: str, ref: str = "", base: str = "",
+                      title: str = "", body: str = "", draft: bool = False,
+                      **kwargs) -> ToolResult:
+        # `pr` WAS IMPLEMENTED HERE AND NOT EXPOSED, which cost CLC-4555 an afternoon. The
+        # expert was told to open a pull request, had no way to, said so correctly, and
+        # blocked. remote_op has handled pr since 2026-11-07 — the header above explains why
+        # PR creation moved into the same process as the ref check — but this schema still
+        # offered only fetch and push, so the capability existed and was unreachable. The
+        # legacy `repo_pr` tool has its own copy with no ref rules and no PR reporting, and
+        # is deliberately NOT the answer: one implementation, one place the rules live.
         ok, payload = await remote_op(repo, op, ref, self._profile_slug,
-                                      token=self.get_credential("GITHUB_TOKEN"))
+                                      token=self.get_credential("GITHUB_TOKEN"),
+                                      base=base, title=title, body=body, draft=bool(draft))
         return ToolResult.ok(payload) if ok else ToolResult.fail(payload)
