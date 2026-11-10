@@ -52,7 +52,7 @@ TAIL_CHARS = 4000
 # dozen docker execs: the steps are ordered and a half-finished sequence would leave a
 # worktree behind, so the cleanup belongs in the same process as the setup.
 SCRIPT = r'''
-import json, os, shutil, subprocess, sys, tempfile, time
+import json, os, re, shutil, subprocess, sys, tempfile, time
 
 root = sys.argv[1]
 os.chdir(root)
@@ -105,7 +105,26 @@ out["testing_sha"] = tip[:12]
 contained = subprocess.run(["git", "merge-base", "--is-ancestor", head, tip]).returncode == 0
 out["already_in_testing"] = contained
 
-wt = tempfile.mkdtemp(prefix="/projects/workspaces/.preflight-")
+# WHERE THE WORKTREE GOES. Not /projects/workspaces, which is root-owned — mkdtemp there
+# fails with EACCES. Not inside the checkout either, where git would see it as untracked
+# content and a stray one could be swept into a commit. The workspace directory ABOVE
+# repos/<owner>/<repo> is the expert's own, so it sits there as a sibling of the clone.
+cands = []
+ws = root
+for _ in range(3):                       # repos/<owner>/<repo> -> the workspace dir
+    ws = os.path.dirname(ws)
+    cands.append(ws)
+cands.append(tempfile.gettempdir())
+wt = ""
+for c in cands:
+    if c and os.path.isdir(c) and os.access(c, os.W_OK):
+        wt = tempfile.mkdtemp(prefix=".preflight-", dir=c)
+        break
+if not wt:
+    out["error"] = ("nowhere writable to put a throwaway worktree (tried %s). Refusing "
+                    "rather than working inside the checkout." % ", ".join(cands))
+    print(json.dumps(out)); sys.exit(0)
+out["worktree_in"] = os.path.dirname(wt)
 shutil.rmtree(wt, ignore_errors=True)
 try:
     a = run(["git", "worktree", "add", "--detach", wt, tip])
@@ -117,11 +136,25 @@ try:
     m = run(["git", "merge", "--no-commit", "--no-ff", head], cwd=wt)
     out["steps"].append(m)
     if m["exit"] != 0:
-        conflicts = subprocess.run(["git", "diff", "--name-only", "--diff-filter=U"],
-                                   cwd=wt, capture_output=True, text=True).stdout.split()
+        # READ THE MERGE'S OWN WORDS, not only the index. The first real run reported
+        # "conflicts: []" while three conflicts were printed right there in the output: the
+        # merge had named them and then died on something else, so the index never reached
+        # an unmerged state and --diff-filter=U found nothing. An empty conflict list beside
+        # a failed merge is the same lie as an exit code with no output.
+        named = re.findall(r"^CONFLICT \(([^)]*)\): Merge conflict in (.+)$",
+                           (m["out"] or "") + (m["err"] or ""), re.M)
+        indexed = subprocess.run(["git", "diff", "--name-only", "--diff-filter=U"],
+                                 cwd=wt, capture_output=True, text=True).stdout.split()
         subprocess.run(["git", "merge", "--abort"], cwd=wt, capture_output=True)
         out["merges_clean"] = False
-        out["conflicts"] = conflicts
+        out["conflicts"] = sorted({p for _k, p in named} | set(indexed))
+        out["conflict_kinds"] = sorted({k for k, _p in named})
+        # A merge can fail WITHOUT a conflict — a broken object store, a missing ref, no
+        # disk. Saying so is the difference between "fix your branch" and "fix the machine".
+        if not out["conflicts"]:
+            out["merge_failed_without_conflict"] = (
+                (m["err"] or m["out"] or "").strip()[-600:]
+                or "the merge failed and said nothing")
         print(json.dumps(out)); sys.exit(0)
     out["merges_clean"] = True
     out["conflicts"] = []

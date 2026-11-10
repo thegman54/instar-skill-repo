@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import git_env, git_author, check_repo_access, validate_path, validate_project_root
+from .base import git_run, git_env, git_author, check_repo_access, validate_path, validate_project_root
 
 
 @register_tool
@@ -58,10 +58,8 @@ class RepoCommitTool(BaseTool):
             validated_files.append(f)
 
         try:
-            stage_result = subprocess.run(
-                ["git", "add", "--"] + validated_files,
+            stage_result = git_run(["git", "add", "--"] + validated_files,
                 cwd=project_root, capture_output=True, text=True, timeout=30,
-                env=git_env(),
             )
             if stage_result.returncode != 0:
                 return ToolResult.fail(f"Stage error: {stage_result.stderr}")
@@ -74,8 +72,7 @@ class RepoCommitTool(BaseTool):
             full_message = (f"{message}\n\nCo-Authored-By: {ident['GIT_AUTHOR_NAME']} "
                             f"<{ident['GIT_AUTHOR_EMAIL']}>")
             # Identity on the commit call only — staging and rev-parse do not need one.
-            commit_result = subprocess.run(
-                ["git", "commit", "-m", full_message],
+            commit_result = git_run(["git", "commit", "-m", full_message],
                 cwd=project_root, capture_output=True, text=True, timeout=30,
                 env=git_env(ident),
             )
@@ -84,10 +81,8 @@ class RepoCommitTool(BaseTool):
                     return ToolResult.fail("Nothing to commit — files may not have changes")
                 return ToolResult.fail(f"Commit error: {commit_result.stderr}")
 
-            hash_result = subprocess.run(
-                ["git", "rev-parse", "--short", "HEAD"],
+            hash_result = git_run(["git", "rev-parse", "--short", "HEAD"],
                 cwd=project_root, capture_output=True, text=True, timeout=10,
-                env=git_env(),
             )
             commit_hash = hash_result.stdout.strip() if hash_result.returncode == 0 else "unknown"
 

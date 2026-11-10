@@ -29,7 +29,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import check_repo_access, git_env, validate_project_root
+from .base import git_run, check_repo_access, git_env, validate_project_root
 from .repo_git import remote_op
 
 
@@ -89,9 +89,8 @@ class RepoPushTool(BaseTool):
             valid, error = validate_project_root(project_root)
             if not valid:
                 return ToolResult.fail(error)
-            result = subprocess.run(
-                ["git", "branch", "--show-current"],
-                cwd=project_root, capture_output=True, text=True, timeout=10, env=git_env())
+            result = git_run(["git", "branch", "--show-current"],
+                cwd=project_root, capture_output=True, text=True, timeout=10)
             if result.returncode != 0 or not result.stdout.strip():
                 return ToolResult.fail(
                     "Could not determine the current branch, so there is nothing to name in "

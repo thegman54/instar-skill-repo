@@ -50,7 +50,7 @@ import structlog
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import check_repo_access, git_env, sanitize_stderr
+from .base import git_run, check_repo_access, git_env, sanitize_stderr
 
 log = structlog.get_logger()
 
@@ -330,13 +330,13 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         # Forced (`+`) because these refs mirror the remote and are never edited locally;
         # a non-fast-forward there means the remote branch moved, which is the case this
         # exists to notice.
-        remote_name = (subprocess.run(["git", "-C", path, "remote"], capture_output=True,
+        remote_name = (git_run(["git", "-C", path, "remote"], capture_output=True,
                                       text=True, timeout=30).stdout.split() or ["origin"])[0]
         refspec = (f"+refs/heads/{ref}:refs/remotes/{remote_name}/{ref}" if ref
                    else f"+refs/heads/*:refs/remotes/{remote_name}/*")
         args = ["fetch", auth, refspec]
-        r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
-                           timeout=180, env=git_env())
+        r = git_run(["git", "-C", path, *args], capture_output=True, text=True,
+                           timeout=180)
         if r.returncode != 0:
             return False, f"fetch failed: {scrub(r.stderr)[-500:]}"
         return True, {"repo": repo, "op": "fetch", "ref": ref or "(all)",
@@ -489,8 +489,8 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         if not answer.get("allowed"):
             return False, f"promotion not approved — {answer.get('reason', 'no reason given')}"
 
-        r = subprocess.run(["git", "-C", path, "push", auth, f"{env}:{env}"],
-                           capture_output=True, text=True, timeout=300, env=git_env())
+        r = git_run(["git", "-C", path, "push", auth, f"{env}:{env}"],
+                           capture_output=True, text=True, timeout=300)
         out = scrub((r.stderr or "") + (r.stdout or ""))
         if r.returncode != 0:
             return False, f"promotion push of {env} failed: {out[-600:]}"
@@ -520,8 +520,8 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
     if ref.startswith(RELEASE_PREFIX):
         cmd.insert(1, "--force-with-lease")
 
-    r = subprocess.run(["git", "-C", path, *cmd], capture_output=True, text=True,
-                       timeout=300, env=git_env())
+    r = git_run(["git", "-C", path, *cmd], capture_output=True, text=True,
+                       timeout=300)
     out = scrub((r.stderr or "") + (r.stdout or ""))
     if r.returncode != 0:
         return False, f"push of {ref} failed: {out[-600:]}"

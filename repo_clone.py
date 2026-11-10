@@ -7,7 +7,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import check_repo_access, git_env, sanitize_stderr
+from .base import git_run, check_repo_access, git_env, sanitize_stderr
 
 
 # Documents a bot has no business reading, hidden from the WORKING TREE of every checkout the
@@ -50,15 +50,13 @@ def apply_sparse_hide(workspace_path: str) -> dict:
     failing a clone over tidiness would be the wrong trade.
     """
     out = {}
-    init = subprocess.run(["git", "sparse-checkout", "init", "--no-cone"],
-                          cwd=workspace_path, capture_output=True, text=True, timeout=30,
-                          env=git_env())
+    init = git_run(["git", "sparse-checkout", "init", "--no-cone"],
+                          cwd=workspace_path, capture_output=True, text=True, timeout=30)
     if init.returncode != 0:
         return {"sparse": "unavailable", "detail": sanitize_stderr(init.stderr)[:160]}
     # "/*" first: include everything, then subtract. Order matters — a later pattern wins.
-    setr = subprocess.run(["git", "sparse-checkout", "set", "/*", *SPARSE_HIDE],
-                          cwd=workspace_path, capture_output=True, text=True, timeout=60,
-                          env=git_env())
+    setr = git_run(["git", "sparse-checkout", "set", "/*", *SPARSE_HIDE],
+                          cwd=workspace_path, capture_output=True, text=True, timeout=60)
     if setr.returncode != 0:
         return {"sparse": "failed", "detail": sanitize_stderr(setr.stderr)[:160]}
     # `set` writes the patterns and is supposed to update the working tree with them. On the
@@ -66,9 +64,8 @@ def apply_sparse_hide(workspace_path: str) -> dict:
     # measured, 31 before and 31 after. `reapply` then removed them. So the tree update is not
     # something to assume from a zero exit status; it is asked for explicitly and its own
     # status is what gets reported.
-    re = subprocess.run(["git", "sparse-checkout", "reapply"],
-                        cwd=workspace_path, capture_output=True, text=True, timeout=120,
-                        env=git_env())
+    re = git_run(["git", "sparse-checkout", "reapply"],
+                        cwd=workspace_path, capture_output=True, text=True, timeout=120)
     out["sparse"] = "applied" if re.returncode == 0 else "patterns written, tree not updated"
     if re.returncode != 0:
         out["detail"] = sanitize_stderr(re.stderr)[:160]
@@ -137,16 +134,33 @@ class RepoCloneTool(BaseTool):
     async def _clone_fresh(
         self, clone_url: str, workspace_path: str, repo: str, branch: str = None
     ) -> ToolResult:
-        os.makedirs(os.path.dirname(workspace_path), exist_ok=True)
+        # Created by root, so hand it over immediately: the clone itself now runs as uid
+        # 1000 (git_run) and cannot write into a root-owned parent. Creating the directory
+        # and creating its contents are two different privileges and they were the same one
+        # until today.
+        parent = os.path.dirname(workspace_path)
+        os.makedirs(parent, exist_ok=True)
+        try:
+            from .base import WORKSPACE_UID, WORKSPACE_GID
+            walk = parent
+            # Only the directories this call may have just created, up to the workspaces
+            # root, and never beyond it.
+            root_dir = os.environ.get("WORKSPACES_ROOT", "/projects/workspaces")
+            while walk and walk.startswith(root_dir) and walk != root_dir:
+                os.chown(walk, WORKSPACE_UID, WORKSPACE_GID)
+                walk = os.path.dirname(walk)
+        except (OSError, PermissionError, ImportError):
+            pass
 
         cmd = ["git", "clone", "--depth", "50", clone_url, workspace_path]
         if branch:
             cmd.extend(["--branch", branch])
 
-        result = subprocess.run(
+        # Through git_run like everything else, so the clone is created owned by uid 1000
+        # rather than by root and then chowned afterwards. The chown below stays: it repairs
+        # a tree cloned by an older version of this tool, and does nothing to a correct one.
+        result = git_run(
             cmd,
-            capture_output=True,
-            text=True,
             timeout=120,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
@@ -203,13 +217,11 @@ class RepoCloneTool(BaseTool):
         self, workspace_path: str, repo: str, branch: str = None, token: str = None
     ) -> ToolResult:
         # Verify remote points to the expected repo
-        remote_result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
+        remote_result = git_run(["git", "remote", "get-url", "origin"],
             cwd=workspace_path,
             capture_output=True,
             text=True,
             timeout=10,
-                env=git_env(),
             )
         if remote_result.returncode == 0:
             current_remote = remote_result.stdout.strip()
@@ -222,23 +234,19 @@ class RepoCloneTool(BaseTool):
         # Temporarily set token URL for fetch
         if token:
             auth_url = f"https://x-access-token:{token}@github.com/{repo}.git"
-            subprocess.run(
-                ["git", "remote", "set-url", "origin", auth_url],
+            git_run(["git", "remote", "set-url", "origin", auth_url],
                 cwd=workspace_path,
                 capture_output=True,
                 text=True,
                 timeout=10,
-                env=git_env(),
             )
 
         if branch:
-            checkout = subprocess.run(
-                ["git", "checkout", branch],
+            checkout = git_run(["git", "checkout", branch],
                 cwd=workspace_path,
                 capture_output=True,
                 text=True,
                 timeout=30,
-                env=git_env(),
             )
             if checkout.returncode != 0:
                 self._sanitize_remote(workspace_path, repo)
@@ -253,13 +261,11 @@ class RepoCloneTool(BaseTool):
         # reported "updated" — one of them 99 commits behind — while nothing moved. A stale
         # checkout that says it is current is worse than one that says it failed, because an
         # expert then reasons confidently about code that is months old.
-        fetch = subprocess.run(
-            ["git", "fetch", "origin"],
+        fetch = git_run(["git", "fetch", "origin"],
             cwd=workspace_path,
             capture_output=True,
             text=True,
             timeout=60,
-            env=git_env(),
         )
         if fetch.returncode != 0:
             self._sanitize_remote(workspace_path, repo)
@@ -267,13 +273,11 @@ class RepoCloneTool(BaseTool):
                 f"Fetch failed for {repo}: {sanitize_stderr(fetch.stderr)}"
             )
 
-        pull_result = subprocess.run(
-            ["git", "pull", "--ff-only"],
+        pull_result = git_run(["git", "pull", "--ff-only"],
             cwd=workspace_path,
             capture_output=True,
             text=True,
             timeout=60,
-            env=git_env(),
         )
 
         self._configure_git(workspace_path)
@@ -306,39 +310,29 @@ class RepoCloneTool(BaseTool):
         })
 
     def _configure_git(self, workspace_path: str):
-        subprocess.run(
-            ["git", "config", "user.email", "bot@instar.local"],
+        git_run(["git", "config", "user.email", "bot@instar.local"],
             cwd=workspace_path, capture_output=True, timeout=5,
-                env=git_env(),
             )
-        subprocess.run(
-            ["git", "config", "user.name", "Instar Bot"],
+        git_run(["git", "config", "user.name", "Instar Bot"],
             cwd=workspace_path, capture_output=True, timeout=5,
-                env=git_env(),
             )
 
     def _sanitize_remote(self, workspace_path: str, repo: str):
         clean_url = f"https://github.com/{repo}.git"
-        subprocess.run(
-            ["git", "remote", "set-url", "origin", clean_url],
+        git_run(["git", "remote", "set-url", "origin", clean_url],
             cwd=workspace_path, capture_output=True, text=True, timeout=5,
-                env=git_env(),
             )
 
     def _get_repo_info(self, workspace_path: str) -> dict:
         info = {}
-        branch_result = subprocess.run(
-            ["git", "branch", "--show-current"],
+        branch_result = git_run(["git", "branch", "--show-current"],
             cwd=workspace_path, capture_output=True, text=True, timeout=5,
-                env=git_env(),
             )
         if branch_result.returncode == 0:
             info["branch"] = branch_result.stdout.strip()
 
-        head_result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+        head_result = git_run(["git", "rev-parse", "--short", "HEAD"],
             cwd=workspace_path, capture_output=True, text=True, timeout=5,
-                env=git_env(),
             )
         if head_result.returncode == 0:
             info["head"] = head_result.stdout.strip()

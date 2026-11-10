@@ -11,6 +11,7 @@ to validate access and get the permitted operation level.
 
 import os
 import re
+import subprocess
 from pathlib import Path
 import structlog
 
@@ -94,6 +95,58 @@ async def git_author(profile_slug: str = "") -> dict:
         except Exception as exc:                                       # noqa: BLE001
             log.warning("git_author_lookup_failed", profile=slug, error=str(exc)[:200])
     return git_identity(slug, display)
+
+
+# WHO THE GIT SUBPROCESS RUNS AS.
+#
+# tool-executor runs as root; the checkouts belong to uid 1000, because the expert-runner is
+# unprivileged and works in the same trees. Root writing into them is not blocked — it is
+# recorded, as root-owned files, and that is the damage. On 2026-11-10 a merge inside an
+# expert's own repository died with "insufficient permission for adding an object to
+# repository database": 156 paths across 22 checkouts were root-owned, 39 in one repo, left
+# by repo_commit and repo_clone over seven weeks. The symptom is worse than the cause,
+# because git fans objects out by the first two hex digits of their hash — so an expert's
+# write succeeded or failed depending on which directory the new object happened to land in.
+#
+# repo_clone already chowned its clone afterwards, which is a sweep rather than a fix: every
+# later write re-created the problem and nothing swept again. Dropping to uid 1000 for the
+# subprocess means the file is never created wrong, so there is nothing to repair.
+#
+# HOME MOVES WITH IT. As uid 1000 the process cannot read root's, and git reading an
+# unreadable global config is a failure rather than a default. Pointed at a temp dir, which
+# costs nothing: safe.directory already arrives through GIT_CONFIG_* below, so nothing this
+# skill relies on lives in a config file.
+WORKSPACE_UID = int(os.environ.get("WORKSPACE_UID", "1000"))
+WORKSPACE_GID = int(os.environ.get("WORKSPACE_GID", "1000"))
+
+
+def git_proc_kwargs() -> dict:
+    """subprocess kwargs that keep git from creating root-owned files. {} when not root."""
+    try:
+        if os.geteuid() != 0:
+            return {}
+    except AttributeError:                                             # pragma: no cover
+        return {}
+    return {"user": WORKSPACE_UID, "group": WORKSPACE_GID}
+
+
+def git_run(args: list, **kw):
+    """Run git the way this skill always should: shared env, and never as root.
+
+    One chokepoint on purpose. The alternative is remembering, at twenty-odd call sites,
+    which ones write — and the one that forgets is never the boring one.
+    """
+    kw.setdefault("capture_output", True)
+    kw.setdefault("text", True)
+    kw.setdefault("timeout", 120)
+    if "env" not in kw:
+        kw["env"] = git_env()
+    drop = git_proc_kwargs()
+    if drop:
+        # The env dict is already built; give the unprivileged process a HOME it can use.
+        kw["env"] = {**kw["env"], "HOME": os.environ.get("GIT_RUN_HOME", "/tmp")}
+        kw.update(drop)
+    return subprocess.run(args, **kw)
 
 
 def git_env(extra: dict = None) -> dict:

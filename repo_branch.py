@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import git_env, check_repo_access, sanitize_stderr, validate_project_root
+from .base import git_run, git_env, check_repo_access, sanitize_stderr, validate_project_root
 
 
 @register_tool
@@ -90,13 +90,11 @@ class RepoBranchTool(BaseTool):
 
         try:
             if action == "list":
-                result = subprocess.run(["git", "branch", "-a", "-v"], cwd=project_root, capture_output=True, text=True, timeout=30,
-                env=git_env(),
+                result = git_run(["git", "branch", "-a", "-v"], cwd=project_root, capture_output=True, text=True, timeout=30,
             )
                 if result.returncode != 0:
                     return ToolResult.fail(f"Git error: {result.stderr}")
-                current = subprocess.run(["git", "branch", "--show-current"], cwd=project_root, capture_output=True, text=True, timeout=10,
-                env=git_env(),
+                current = git_run(["git", "branch", "--show-current"], cwd=project_root, capture_output=True, text=True, timeout=10,
             )
                 return ToolResult.ok({"current": current.stdout.strip() if current.returncode == 0 else "unknown", "branches": result.stdout.strip()})
 
@@ -111,8 +109,7 @@ class RepoBranchTool(BaseTool):
                 # died on "dubious ownership" against any workspace clone chowned to uid
                 # 1000 for the expert-runner — which is all of them. Creating a branch is
                 # the first thing an expert does, so the whole write path ended here.
-                result = subprocess.run(cmd, cwd=project_root, capture_output=True,
-                                        text=True, timeout=30, env=git_env())
+                result = git_run(cmd, cwd=project_root, timeout=30)
                 if result.returncode != 0:
                     if "already exists" in result.stderr.lower():
                         return ToolResult.fail(f"Branch '{name}' already exists")
@@ -122,8 +119,7 @@ class RepoBranchTool(BaseTool):
             elif action == "switch":
                 if not name:
                     return ToolResult.fail("Branch name required for switch")
-                result = subprocess.run(["git", "checkout", name], cwd=project_root, capture_output=True, text=True, timeout=30,
-                env=git_env(),
+                result = git_run(["git", "checkout", name], cwd=project_root, capture_output=True, text=True, timeout=30,
             )
                 if result.returncode != 0:
                     stderr = result.stderr.lower()
