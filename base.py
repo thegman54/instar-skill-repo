@@ -283,7 +283,18 @@ async def check_repo_access(repo: str, operation: str = "read",
             # A SEPARATE flag rather than widening repo_read_all, so a profile that only needs to
             # read its neighbours still cannot write to them, and so granting this stays a
             # visible decision on whichever profile holds it.
-            if operation not in READ_OPS and not write_all:
+            # A PULL REQUEST IS NOT A WRITE TO THE REPO. It moves no branch and changes no file;
+            # it asks a person to merge, and the person is the control. The coordinator opens
+            # every testing PR in a patch repo -- repo_git refuses the op to the repo's own
+            # expert -- but its workspace held only CDS, so on 2026-11-11 CLC-4615 (in
+            # entity-feature-data-loaders) stopped with nobody in the fleet able to open the PR.
+            # repo_write_all would have fixed that by also letting it edit and commit in every
+            # other expert's checkout. So: a profile that may READ outside its workspace may
+            # also open a PR there, and nothing else. repo_git's own pr rules (environment base
+            # only, never the registered expert) still apply after this.
+            if operation == "pr" and read_all and not write_all:
+                pass
+            elif operation not in READ_OPS and not write_all:
                 return False, "", access, (
                     f"'{repo}' is outside this profile's workspace, and '{operation}' writes. "
                     "That needs the repo_write_all grant, which this profile does not have."), None
