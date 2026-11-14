@@ -343,7 +343,13 @@ class RepoPreflightTool(BaseTool):
         elif clean is False:
             verdict = ("CONFLICTS WITH TESTING in %d file(s): %s. git-gate would abort the "
                        "promotion whole and leave testing untouched, so nothing is at risk "
-                       "— but it cannot be promoted until the branch is updated."
+                       "— but it cannot be promoted until the branch is updated. If an "
+                       "earlier round of this ticket already reached testing (as "
+                       "cherry-picks), that is the usual cause: do NOT merge testing into "
+                       "the bot branch. The expert cuts bot/<TICKET>-testing from testing, "
+                       "cherry-picks only the commits testing lacks (where_is lists which "
+                       "landed) and pushes it, without git-gate verify; preflight THAT branch "
+                       "(it is the build evidence) and open the testing PR from it."
                        % (len(data.get("conflicts") or []),
                           ", ".join((data.get("conflicts") or [])[:12])))
         else:

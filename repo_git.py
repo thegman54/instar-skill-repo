@@ -58,6 +58,25 @@ log = structlog.get_logger()
 BOT_PREFIX = "bot/"
 RELEASE_PREFIX = "release/"
 
+# A unit's TESTING LANDING branch: bot/<TICKET>-testing, cut from testing, carrying only the
+# unit's commits that testing does not already have, so its PR to testing contains the new
+# work and nothing else. Needed the moment a ticket has a second round: round one reached
+# testing as conflict-adjusted cherry-picks, so bot/<TICKET> -> testing re-applies it and
+# conflicts (CLC-4555 CDS, 2026-11-14: four files, while the round-two commit alone applied
+# clean). Same authority as the bot branch it lands — an open unit — and rebuilt from testing
+# each round, so it is the one bot ref that may force-with-lease.
+LANDING_SUFFIX = "-testing"
+
+
+def bot_ticket(ref: str) -> tuple:
+    """(ticket, is_landing) for a bot ref, ("", False) for anything else."""
+    if not ref.startswith(BOT_PREFIX):
+        return "", False
+    rest = ref[len(BOT_PREFIX):]
+    if rest.endswith(LANDING_SUFFIX) and TICKET_RE.match(rest[:-len(LANDING_SUFFIX)]):
+        return rest[:-len(LANDING_SUFFIX)], True
+    return (rest, False) if TICKET_RE.match(rest) else ("", False)
+
 # Never pushable here under any argument. Listed by name rather than read from a policy file:
 # policy is data, and data the caller can edit is not a guard.
 NEVER = {"main", "master", "production", "production-v2", "testing", "staging",
@@ -210,10 +229,10 @@ async def may_push(repo: str, ref: str) -> tuple:
                        "registry row; do not look for another way round it.")
 
     if ref.startswith(BOT_PREFIX):
-        ticket = ref[len(BOT_PREFIX):]
-        if not TICKET_RE.match(ticket):
-            return False, (f"{ref!r} is in the bot namespace but {ticket!r} is not a ticket "
-                           "key. Branches are named bot/<TICKET>, e.g. bot/CLC-4156.")
+        ticket, landing = bot_ticket(ref)
+        if not ticket:
+            return False, (f"{ref!r} is in the bot namespace but is not bot/<TICKET> or "
+                           f"bot/<TICKET>{LANDING_SUFFIX}, e.g. bot/CLC-4156.")
         n, named = await _units(repo_slug, ticket)
         if n < 0:
             # Fails CLOSED, the same rule the promotion check follows: a gate that cannot
@@ -230,13 +249,16 @@ async def may_push(repo: str, ref: str) -> tuple:
         # source for — which is exactly how a repo manual saying `feat/` stayed invisible.
         # A unit raised before branches were named carries no name; those still pass on the
         # ticket alone rather than becoming unpushable.
-        if named and ref != named:
-            return False, (f"this unit's branch is {named!r}, not {ref!r}. The coordinator "
+        expected = (named + LANDING_SUFFIX) if (named and landing) else named
+        if expected and ref != expected:
+            return False, (f"this unit's branch is {expected!r}, not {ref!r}. The coordinator "
                            "names the branch when it raises the work; use the name it gave "
-                           "rather than composing one, and if that name looks wrong say so "
-                           "instead of pushing a different ref.")
+                           "(its testing landing branch adds only "
+                           f"{LANDING_SUFFIX!r}) rather than composing one, and if that name "
+                           "looks wrong say so instead of pushing a different ref.")
         return True, (f"open work unit for {ticket} in {repo_slug}"
-                      + (f", branch named {named}" if named else ""))
+                      + (f", branch named {named}" if named else "")
+                      + (" (its testing landing branch)" if landing else ""))
 
     if ref.startswith(RELEASE_PREFIX):
         group_key = ref[len(RELEASE_PREFIX):]
@@ -269,10 +291,8 @@ async def _record(repo: str, op: str, ref: str, decision: str, reason: str,
         pool = get_pool()
         if not pool:
             return
-        ticket = ""
-        if ref.startswith(BOT_PREFIX) and TICKET_RE.match(ref[len(BOT_PREFIX):]):
-            ticket = ref[len(BOT_PREFIX):]
-        elif ref.startswith(RELEASE_PREFIX):
+        ticket = bot_ticket(ref)[0]
+        if not ticket and ref.startswith(RELEASE_PREFIX):
             ticket = ref[len(RELEASE_PREFIX):]
         async with pool.acquire() as conn:
             await conn.execute(
@@ -303,7 +323,7 @@ async def _report_pr(repo: str, ref: str, base: str, url: str, profile_slug: str
     fleet was unreachable. The failure is returned so the caller can say it out loud rather
     than let it pass as success.
     """
-    ticket = ref[len(BOT_PREFIX):] if ref.startswith(BOT_PREFIX) else ""
+    ticket = bot_ticket(ref)[0]
     if not (ticket and url):
         return "no ticket in the ref, or no url" if not ticket else "the PR has no url"
     # The fleet names targets by environment, not by branch. A base that is not an
@@ -344,7 +364,7 @@ async def _fleet_pr_text(repo: str, ref: str) -> tuple:
     the rendered one. Best effort: a fleet that cannot answer leaves the defaults in place
     rather than refusing to open the request.
     """
-    ticket = ref[len(BOT_PREFIX):] if ref.startswith(BOT_PREFIX) else ""
+    ticket = bot_ticket(ref)[0]
     if not ticket:
         return "", ""
     import json as _j
@@ -667,7 +687,7 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
     # so are legitimately non-fast-forward. Everything else fast-forwards or fails; an expert
     # that needs history rewritten has a problem a force push would hide.
     cmd = ["push", auth, f"{ref}:{ref}"]
-    if ref.startswith(RELEASE_PREFIX):
+    if ref.startswith(RELEASE_PREFIX) or bot_ticket(ref)[1]:
         cmd.insert(1, "--force-with-lease")
 
     r = git_run(["git", "-C", path, *cmd], capture_output=True, text=True,
@@ -699,9 +719,13 @@ class RepoGitTool(BaseTool):
             "What is allowed:\n"
             "  fetch                — always\n"
             "  push bot/<TICKET>    — only if an OPEN work unit exists for this repo and ticket\n"
+            "  push bot/<TICKET>-testing — the same unit's TESTING LANDING branch: cut from "
+            "testing, carrying only the unit's commits testing lacks. Use it when "
+            "bot/<TICKET> no longer merges cleanly into testing (a second round after the "
+            "first landed as cherry-picks). Rebuilt each round, so it force-pushes with lease\n"
             "  push release/<KEY>   — only if this repo is a member of that release group\n\n"
             "Always refused: environment branches (production, testing, staging, main), "
-            "deleting any ref, and force-pushing anything but a release branch.\n\n"
+            "deleting any ref, and force-pushing anything but a release or landing branch.\n\n"
             "  pr                   — open a pull request from a branch you pushed into "
             "another branch. Opening is allowed; MERGING stays a human decision, and the "
             "fleet records the request so a delivery rung can observe it landing.\n\n"
