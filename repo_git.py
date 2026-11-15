@@ -254,6 +254,13 @@ async def may_push(repo: str, ref: str) -> tuple:
         # source for — which is exactly how a repo manual saying `feat/` stayed invisible.
         # A unit raised before branches were named carries no name; those still pass on the
         # ticket alone rather than becoming unpushable.
+        # A unit's recorded branch can already be its landing branch: delivery writes the
+        # pushed ref back to the unit, so on CLC-4615 (2026-11-15) the unit read
+        # bot/CLC-4615-testing and this check demanded bot/CLC-4615-testing-testing, a branch
+        # that cannot exist. Compare base names, then add the landing suffix once.
+        _, recorded_landing = bot_ticket(named)
+        if recorded_landing:
+            named = named[: -len(recorded_landing)]
         expected = (named + landing) if (named and landing) else named
         if expected and ref != expected:
             return False, (f"this unit's branch is {expected!r}, not {ref!r}. The coordinator "
