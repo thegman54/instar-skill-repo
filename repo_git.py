@@ -66,16 +66,21 @@ RELEASE_PREFIX = "release/"
 # clean). Same authority as the bot branch it lands — an open unit — and rebuilt from testing
 # each round, so it is the one bot ref that may force-with-lease.
 LANDING_SUFFIX = "-testing"
+# -staging added 2026-11-15 with the staging promotion: a unit whose bot branch conflicts with
+# staging lands through bot/<TICKET>-staging, cut from staging, exactly as -testing does.
+LANDING_SUFFIXES = ("-testing", "-staging")
 
 
 def bot_ticket(ref: str) -> tuple:
-    """(ticket, is_landing) for a bot ref, ("", False) for anything else."""
+    """(ticket, landing_suffix) for a bot ref — the suffix is "" for the plain bot branch and
+    truthy for a landing branch; ("", "") for anything else."""
     if not ref.startswith(BOT_PREFIX):
-        return "", False
+        return "", ""
     rest = ref[len(BOT_PREFIX):]
-    if rest.endswith(LANDING_SUFFIX) and TICKET_RE.match(rest[:-len(LANDING_SUFFIX)]):
-        return rest[:-len(LANDING_SUFFIX)], True
-    return (rest, False) if TICKET_RE.match(rest) else ("", False)
+    for suffix in LANDING_SUFFIXES:
+        if rest.endswith(suffix) and TICKET_RE.match(rest[:-len(suffix)]):
+            return rest[:-len(suffix)], suffix
+    return (rest, "") if TICKET_RE.match(rest) else ("", "")
 
 # Never pushable here under any argument. Listed by name rather than read from a policy file:
 # policy is data, and data the caller can edit is not a guard.
@@ -232,7 +237,7 @@ async def may_push(repo: str, ref: str) -> tuple:
         ticket, landing = bot_ticket(ref)
         if not ticket:
             return False, (f"{ref!r} is in the bot namespace but is not bot/<TICKET> or "
-                           f"bot/<TICKET>{LANDING_SUFFIX}, e.g. bot/CLC-4156.")
+                           f"bot/<TICKET>-testing|-staging, e.g. bot/CLC-4156.")
         n, named = await _units(repo_slug, ticket)
         if n < 0:
             # Fails CLOSED, the same rule the promotion check follows: a gate that cannot
@@ -249,16 +254,16 @@ async def may_push(repo: str, ref: str) -> tuple:
         # source for — which is exactly how a repo manual saying `feat/` stayed invisible.
         # A unit raised before branches were named carries no name; those still pass on the
         # ticket alone rather than becoming unpushable.
-        expected = (named + LANDING_SUFFIX) if (named and landing) else named
+        expected = (named + landing) if (named and landing) else named
         if expected and ref != expected:
             return False, (f"this unit's branch is {expected!r}, not {ref!r}. The coordinator "
                            "names the branch when it raises the work; use the name it gave "
-                           "(its testing landing branch adds only "
-                           f"{LANDING_SUFFIX!r}) rather than composing one, and if that name "
+                           "(a landing branch adds only "
+                           f"{landing or '-testing'!r}) rather than composing one, and if that name "
                            "looks wrong say so instead of pushing a different ref.")
         return True, (f"open work unit for {ticket} in {repo_slug}"
                       + (f", branch named {named}" if named else "")
-                      + (" (its testing landing branch)" if landing else ""))
+                      + (f" (its {landing[1:]} landing branch)" if landing else ""))
 
     if ref.startswith(RELEASE_PREFIX):
         group_key = ref[len(RELEASE_PREFIX):]
