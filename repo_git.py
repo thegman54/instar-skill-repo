@@ -398,7 +398,8 @@ async def _fleet_pr_text(repo: str, ref: str) -> tuple:
 
 async def remote_op(repo: str, op: str, ref: str = "", profile_slug: str = "",
                     token: str = None, ticket_hint: str = "", base: str = "",
-                    title: str = "", body: str = "", draft: bool = False) -> tuple:
+                    title: str = "", body: str = "", draft: bool = False,
+                    commits: list = None, verified: str = "") -> tuple:
     """Validate, perform, and RECORD one remote operation. Returns (ok, payload_or_reason).
 
     Recording happens here, around the whole decision, rather than at each return. A dozen
@@ -406,7 +407,7 @@ async def remote_op(repo: str, op: str, ref: str = "", profile_slug: str = "",
     does not, and the one that forgets is never the boring one.
     """
     ok, payload = await _decide(repo, op, ref, profile_slug, token, ticket_hint,
-                                base, title, body, draft)
+                                base, title, body, draft, commits, verified)
     if ok:
         why = payload.get("why_allowed") or f"{op} performed"
         await _record(repo, op, ref, "allowed", why, profile_slug)
@@ -421,10 +422,11 @@ async def remote_op(repo: str, op: str, ref: str = "", profile_slug: str = "",
 
 async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
                   token: str = None, ticket_hint: str = "", base: str = "",
-                  title: str = "", body: str = "", draft: bool = False) -> tuple:
+                  title: str = "", body: str = "", draft: bool = False,
+                  commits: list = None, verified: str = "") -> tuple:
     """The decision itself, with no knowledge of how it gets recorded."""
-    if op not in ("fetch", "push", "promote", "pr"):
-        return False, f"unknown op {op!r} — expected fetch, push, promote or pr"
+    if op not in ("fetch", "push", "promote", "pr", "land"):
+        return False, f"unknown op {op!r} — expected fetch, push, promote, pr or land"
 
     valid, path, _access, error, _branch = await check_repo_access(
         repo, "read" if op == "fetch" else "push", profile_slug)
@@ -477,6 +479,25 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         return True, {"repo": repo, "op": "fetch", "ref": ref or "(all)",
                       "output": scrub(r.stderr or r.stdout)[-600:]}
 
+
+    # ---------------------------------------------------------------- land
+    # Cut bot/<TICKET>-<env> from <env> and cherry-pick the ticket's commits (repo_land.py).
+    # Same authority as pushing that landing branch: an open unit for the ticket.
+    if op == "land":
+        ticket = (ticket_hint or "").strip().upper()
+        if not TICKET_RE.match(ticket):
+            return False, "land needs `ticket`, e.g. CLC-4615"
+        landing = f"bot/{ticket}-{ref}"
+        allowed, why = await may_push(repo, landing)
+        if not allowed:
+            return False, why
+        from .repo_land import land                                     # noqa: PLC0415
+        ok, payload = await land(path, auth, scrub, ref, ticket, commits or [], verified,
+                                 profile_slug)
+        if ok:
+            payload.update({"repo": repo, "why_allowed": why})
+            log.info("repo_git_land", repo=repo, branch=landing, picks=len(commits or []))
+        return ok, payload
 
     # ---------------------------------------------------------------- pr
     #
@@ -747,7 +768,12 @@ class RepoGitTool(BaseTool):
             "testing, carrying only the unit's commits testing lacks. Use it when "
             "bot/<TICKET> no longer merges cleanly into testing (a second round after the "
             "first landed as cherry-picks). Rebuilt each round, so it force-pushes with lease\n"
-            "  push release/<KEY>   — only if this repo is a member of that release group\n\n"
+            "  push release/<KEY>   — only if this repo is a member of that release group\n"
+            "  land ref=<env> ticket=<KEY> commits=[...] — cut bot/<KEY>-<env> from <env> and "
+            "cherry-pick the ticket's commits onto it, in a scratch worktree. A conflict is "
+            "resolved only when provably exact (the env's file equals the verified env's file "
+            "before this ticket); otherwise it stops and returns both sides. Use it when "
+            "bot/<KEY> does not merge cleanly into <env>. It builds nothing.\n\n"
             "Always refused: environment branches (production, testing, staging, main), "
             "deleting any ref, and force-pushing anything but a release or landing branch.\n\n"
             "  pr                   — open a pull request from a branch you pushed into "
@@ -770,7 +796,7 @@ class RepoGitTool(BaseTool):
             "properties": {
                 "repo": {"type": "string",
                          "description": "owner/repo, e.g. cenora-llc/cenora-core-data-services"},
-                "op": {"type": "string", "enum": ["fetch", "push", "pr"]},
+                "op": {"type": "string", "enum": ["fetch", "push", "pr", "land"]},
                 "ref": {"type": "string",
                         "description": "Branch to push, e.g. bot/CLC-4156. For fetch, the "
                                        "branch to fetch (optional; defaults to all). For "
@@ -783,6 +809,16 @@ class RepoGitTool(BaseTool):
                 "body": {"type": "string", "description": "pr only: the request's body."},
                 "draft": {"type": "boolean",
                           "description": "pr only: open it as a draft. Default false."},
+                "ticket": {"type": "string",
+                           "description": "land only: the ticket, e.g. CLC-4615."},
+                "commits": {"type": "array", "items": {"type": "string"},
+                            "description": "land only: the ticket's commit shas, in the "
+                                           "order to apply them."},
+                "verified": {"type": "string",
+                             "description": "land only: the environment where this work is "
+                                            "already verified (default testing when landing "
+                                            "on staging). A conflict is resolved from it only "
+                                            "when that is provably exact."},
             },
             "required": ["repo", "op"],
         }
@@ -792,6 +828,7 @@ class RepoGitTool(BaseTool):
 
     async def execute(self, repo: str, op: str, ref: str = "", base: str = "",
                       title: str = "", body: str = "", draft: bool = False,
+                      ticket: str = "", commits: list = None, verified: str = "",
                       **kwargs) -> ToolResult:
         # `pr` WAS IMPLEMENTED HERE AND NOT EXPOSED, which cost CLC-4555 an afternoon. The
         # expert was told to open a pull request, had no way to, said so correctly, and
@@ -802,5 +839,6 @@ class RepoGitTool(BaseTool):
         # is deliberately NOT the answer: one implementation, one place the rules live.
         ok, payload = await remote_op(repo, op, ref, self._profile_slug,
                                       token=self.get_credential("GITHUB_TOKEN"),
-                                      base=base, title=title, body=body, draft=bool(draft))
+                                      ticket_hint=ticket, base=base, title=title, body=body,
+                                      draft=bool(draft), commits=commits, verified=verified)
         return ToolResult.ok(payload) if ok else ToolResult.fail(payload)
