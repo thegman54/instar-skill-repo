@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import tempfile
+import uuid
 
 from .base import git_env, git_identity, git_run
 
@@ -90,7 +91,10 @@ async def land(path: str, auth: str, scrub, env: str, ticket: str, commits: list
         if not _blob(path, f"{c}^{{commit}}"):
             return False, f"commit {c} is not in this repository (fetched every branch)"
 
-    wt = tempfile.mkdtemp(prefix="land_")
+    # A path git creates itself, NOT tempfile.mkdtemp: git_run drops root, and mkdtemp's 0700
+    # root-owned directory made every land fail with "'/tmp/land_…' already exists"
+    # (CLC-4644, 2026-11-16, the first land ever run by the coordinator).
+    wt = os.path.join(tempfile.gettempdir(), f"land_{uuid.uuid4().hex[:12]}")
     ident = git_env(git_identity(profile_slug))
     picks, resolved = [], []
     try:
