@@ -556,6 +556,18 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
             return False, (f"{base!r} is not an environment branch. A pull request here is "
                            "how work reaches an environment for a person to merge.")
 
+        # A landing branch is cut from ONE environment and goes back into that one only.
+        # CLC-4615, 2026-11-16: bot/CLC-4615-testing (cut from testing) was opened into
+        # staging and carried all of testing with it: 529 files, +18,881/-3,458.
+        _, landing = bot_ticket(ref)
+        if landing and landing != f"-{base}":
+            return False, (f"{ref} is the {landing[1:]} landing branch: it was cut from "
+                           f"{landing[1:]} and carries {landing[1:]}'s history, so a PR into "
+                           f"{base} would bring all of {landing[1:]} with it. Open {base} "
+                           f"from bot/<TICKET>, or, if that conflicts with {base}, have the "
+                           f"dev cut bot/<TICKET>-{base} from origin/{base} with only the "
+                           "unit's commits.")
+
         owner = repo.split("/")[0]
         api = f"https://api.github.com/repos/{repo}/pulls"
         headers = {
