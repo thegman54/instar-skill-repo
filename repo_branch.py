@@ -101,9 +101,38 @@ class RepoBranchTool(BaseTool):
             elif action == "create":
                 if not name:
                     return ToolResult.fail("Branch name required for create")
-                cmd = ["git", "checkout", "-b", name]
-                if from_branch:
-                    cmd.append(from_branch)
+                # NEVER CUT A TICKET BRANCH FROM ANOTHER TICKET'S BRANCH. The checkout is
+                # shared, so "the current branch" is whatever the last unit left there:
+                # CLC-4664 (2026-11-16) was cut from bot/CLC-4644 and carried its commit.
+                # Without from_branch, a checkout sitting on a bot/ branch is refused.
+                current = git_run(["git", "branch", "--show-current"], cwd=project_root,
+                                  timeout=10).stdout.strip()
+                if not from_branch and current.startswith("bot/") and current != name:
+                    return ToolResult.fail(
+                        f"The checkout is on {current}, another ticket's branch. Pass "
+                        f"from_branch with the base this work starts from (e.g. "
+                        f"origin/production), so {name} does not inherit {current}'s commits.")
+                # RE-CUT, SAFELY. A branch that already exists may be re-cut from from_branch
+                # only when none of its commits exist solely on it (every one is on some
+                # remote ref): nothing is lost, and a wrong base can be corrected by the dev
+                # itself instead of by a person.
+                exists = git_run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"],
+                                 cwd=project_root, timeout=10).returncode == 0
+                if exists and from_branch:
+                    own = git_run(["git", "rev-list", name, "--not", "--remotes"],
+                                  cwd=project_root, timeout=30).stdout.split()
+                    if own:
+                        return ToolResult.fail(
+                            f"Branch '{name}' already exists with {len(own)} commit(s) that are "
+                            "on no remote; re-cutting it would lose them. Push or escalate.")
+                    if git_run(["git", "status", "--porcelain"], cwd=project_root,
+                               timeout=30).stdout.strip():
+                        return ToolResult.fail("Uncommitted changes in the checkout; re-cut refused.")
+                    cmd = ["git", "checkout", "-B", name, from_branch]
+                else:
+                    cmd = ["git", "checkout", "-b", name]
+                    if from_branch:
+                        cmd.append(from_branch)
                 # env=git_env() like every other git call in this skill. This one was the
                 # single exception, so it inherited an environment without GIT_SAFE_ENV and
                 # died on "dubious ownership" against any workspace clone chowned to uid
