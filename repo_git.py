@@ -71,6 +71,34 @@ LANDING_SUFFIX = "-testing"
 LANDING_SUFFIXES = ("-testing", "-staging")
 
 
+COORDINATOR_SLUG = os.environ.get("FLEET_COORDINATOR_SLUG", "fleet_cen_alex")
+
+
+def tell_coordinator(repo: str, ref: str, sha: str, profile_slug: str) -> None:
+    """A landing branch pushed by someone other than the coordinator: she opens its PR, so
+    she has to hear about it. CLC-4555, 2026-11-16: the dev pushed bot/CLC-4555-staging and
+    nothing told anyone; the PR opened only when a person rang her. Through the fleet's ring
+    outbox, so it is retried if it does not land. Never raises."""
+    ticket, landing = bot_ticket(ref)
+    if not landing or not ticket or profile_slug == COORDINATOR_SLUG:
+        return
+    env = landing[1:]
+    msg = (f"[LANDING BRANCH PUSHED] {profile_slug} pushed {ref} for {ticket} in {repo} at "
+           f"{sha[:12]}. It was cut from {env} for the {env} PR. Read the unit notes for what "
+           f"was picked and how any conflict was resolved, then open the PR yourself: repo_git "
+           f"op=pr ref={ref} base={env}. If a PR into {env} from another branch is open for "
+           f"this unit, close it with repo_git op=close and say what replaces it.")
+    try:
+        req = urllib.request.Request(
+            FLEET_API + "/api/fleet/rings", method="POST",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps({"profile": COORDINATOR_SLUG, "conversation": f"fleet:ticket:{ticket}",
+                             "message": msg, "purpose": "landing-pushed"}).encode())
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as exc:                                            # noqa: BLE001
+        log.warning("repo_git_tell_coordinator_failed", ref=ref, error=str(exc)[:200])
+
+
 def bot_ticket(ref: str) -> tuple:
     """(ticket, landing_suffix) for a bot ref — the suffix is "" for the plain bot branch and
     truthy for a landing branch; ("", "") for anything else."""
@@ -399,7 +427,8 @@ async def _fleet_pr_text(repo: str, ref: str) -> tuple:
 async def remote_op(repo: str, op: str, ref: str = "", profile_slug: str = "",
                     token: str = None, ticket_hint: str = "", base: str = "",
                     title: str = "", body: str = "", draft: bool = False,
-                    commits: list = None, verified: str = "") -> tuple:
+                    commits: list = None, verified: str = "", number: int = 0,
+                    reason: str = "") -> tuple:
     """Validate, perform, and RECORD one remote operation. Returns (ok, payload_or_reason).
 
     Recording happens here, around the whole decision, rather than at each return. A dozen
@@ -407,7 +436,7 @@ async def remote_op(repo: str, op: str, ref: str = "", profile_slug: str = "",
     does not, and the one that forgets is never the boring one.
     """
     ok, payload = await _decide(repo, op, ref, profile_slug, token, ticket_hint,
-                                base, title, body, draft, commits, verified)
+                                base, title, body, draft, commits, verified, number, reason)
     if ok:
         why = payload.get("why_allowed") or f"{op} performed"
         await _record(repo, op, ref, "allowed", why, profile_slug)
@@ -423,10 +452,11 @@ async def remote_op(repo: str, op: str, ref: str = "", profile_slug: str = "",
 async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
                   token: str = None, ticket_hint: str = "", base: str = "",
                   title: str = "", body: str = "", draft: bool = False,
-                  commits: list = None, verified: str = "") -> tuple:
+                  commits: list = None, verified: str = "", number: int = 0,
+                  reason: str = "") -> tuple:
     """The decision itself, with no knowledge of how it gets recorded."""
-    if op not in ("fetch", "push", "promote", "pr", "land"):
-        return False, f"unknown op {op!r} — expected fetch, push, promote, pr or land"
+    if op not in ("fetch", "push", "promote", "pr", "land", "close"):
+        return False, f"unknown op {op!r} — expected fetch, push, promote, pr, land or close"
 
     valid, path, _access, error, _branch = await check_repo_access(
         repo, "read" if op == "fetch" else "push", profile_slug)
@@ -480,6 +510,56 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
                       "output": scrub(r.stderr or r.stdout)[-600:]}
 
 
+    # ---------------------------------------------------------------- close
+    # Close a pull request the FLEET opened (head bot/...), with the reason posted on it.
+    # CLC-4615/4555, 2026-11-16: three wrong or replaced PRs (#142, #143, #267) needed a
+    # person to close them, because the fleet could open a PR and never take one back.
+    # Merging stays a person's; closing only withdraws a request, and it can be reopened.
+    if op == "close":
+        reason = (reason or "").strip()
+        try:
+            number = int(number or 0)
+        except (TypeError, ValueError):
+            number = 0
+        if number <= 0 or len(reason) < 15:
+            return False, ("close needs the PR `number` and a `reason` (at least a sentence: "
+                           "what replaces it, or why it is withdrawn). The reason is posted "
+                           "on the PR.")
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                   "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "instar-repo-git",
+                   "Content-Type": "application/json"}
+
+        def _gh(url, data=None, method="GET"):
+            req = urllib.request.Request(
+                url, data=(json.dumps(data).encode() if data is not None else None),
+                headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read().decode() or "null")
+        api = f"https://api.github.com/repos/{repo}"
+        try:
+            pr = _gh(f"{api}/pulls/{number}")
+        except Exception as exc:                                        # noqa: BLE001
+            return False, f"could not read PR #{number}: {scrub(str(exc))[:200]}"
+        head = ((pr or {}).get("head") or {}).get("ref", "")
+        if not head.startswith(BOT_PREFIX):
+            return False, (f"PR #{number} comes from {head!r}, not a fleet branch "
+                           f"({BOT_PREFIX}...). Only a request the fleet opened may be "
+                           "closed here; anyone else's is a person's call.")
+        if pr.get("merged"):
+            return False, f"PR #{number} is already merged; there is nothing to close."
+        if pr.get("state") == "closed":
+            return True, {"repo": repo, "op": "close", "number": number, "already": True,
+                          "why_allowed": "it was already closed"}
+        try:
+            _gh(f"{api}/issues/{number}/comments", {"body": f"Closed by the fleet: {reason}"},
+                "POST")
+            _gh(f"{api}/pulls/{number}", {"state": "closed"}, "PATCH")
+        except Exception as exc:                                        # noqa: BLE001
+            return False, f"closing PR #{number} failed: {scrub(str(exc))[:300]}"
+        log.info("repo_git_close", repo=repo, number=number, head=head)
+        return True, {"repo": repo, "op": "close", "number": number, "head": head,
+                      "why_allowed": f"a fleet PR ({head}), closed with its reason posted"}
+
     # ---------------------------------------------------------------- land
     # Cut bot/<TICKET>-<env> from <env> and cherry-pick the ticket's commits (repo_land.py).
     # Same authority as pushing that landing branch: an open unit for the ticket.
@@ -497,6 +577,7 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         if ok:
             payload.update({"repo": repo, "why_allowed": why})
             log.info("repo_git_land", repo=repo, branch=landing, picks=len(commits or []))
+            tell_coordinator(repo, landing, payload.get("head", ""), profile_slug)
         return ok, payload
 
     # ---------------------------------------------------------------- pr
@@ -742,6 +823,9 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         return False, f"push of {ref} failed: {out[-600:]}"
 
     log.info("repo_git_push", repo=repo, ref=ref, profile=profile_slug)
+    if bot_ticket(ref)[1]:
+        head = git_run(["git", "-C", path, "rev-parse", ref]).stdout.strip()
+        tell_coordinator(repo, ref, head, profile_slug)
     return True, {"repo": repo, "op": "push", "ref": ref, "why_allowed": why,
                   "output": out[-600:]}
 
@@ -773,7 +857,9 @@ class RepoGitTool(BaseTool):
             "cherry-pick the ticket's commits onto it, in a scratch worktree. A conflict is "
             "resolved only when provably exact (the env's file equals the verified env's file "
             "before this ticket); otherwise it stops and returns both sides. Use it when "
-            "bot/<KEY> does not merge cleanly into <env>. It builds nothing.\n\n"
+            "bot/<KEY> does not merge cleanly into <env>. It builds nothing.\n"
+            "  close number=<PR> reason=<why> — close a PR the fleet opened (head bot/...), "
+            "posting the reason; use it when a PR is replaced or wrong. Never a person's PR.\n\n"
             "Always refused: environment branches (production, testing, staging, main), "
             "deleting any ref, and force-pushing anything but a release or landing branch.\n\n"
             "  pr                   — open a pull request from a branch you pushed into "
@@ -796,7 +882,7 @@ class RepoGitTool(BaseTool):
             "properties": {
                 "repo": {"type": "string",
                          "description": "owner/repo, e.g. cenora-llc/cenora-core-data-services"},
-                "op": {"type": "string", "enum": ["fetch", "push", "pr", "land"]},
+                "op": {"type": "string", "enum": ["fetch", "push", "pr", "land", "close"]},
                 "ref": {"type": "string",
                         "description": "Branch to push, e.g. bot/CLC-4156. For fetch, the "
                                        "branch to fetch (optional; defaults to all). For "
@@ -811,6 +897,11 @@ class RepoGitTool(BaseTool):
                           "description": "pr only: open it as a draft. Default false."},
                 "ticket": {"type": "string",
                            "description": "land only: the ticket, e.g. CLC-4615."},
+                "number": {"type": "integer",
+                           "description": "close only: the pull request number."},
+                "reason": {"type": "string",
+                           "description": "close only: why, posted on the PR (what replaces "
+                                          "it, e.g. 'replaced by #268')."},
                 "commits": {"type": "array", "items": {"type": "string"},
                             "description": "land only: the ticket's commit shas, in the "
                                            "order to apply them."},
@@ -829,7 +920,7 @@ class RepoGitTool(BaseTool):
     async def execute(self, repo: str, op: str, ref: str = "", base: str = "",
                       title: str = "", body: str = "", draft: bool = False,
                       ticket: str = "", commits: list = None, verified: str = "",
-                      **kwargs) -> ToolResult:
+                      number: int = 0, reason: str = "", **kwargs) -> ToolResult:
         # `pr` WAS IMPLEMENTED HERE AND NOT EXPOSED, which cost CLC-4555 an afternoon. The
         # expert was told to open a pull request, had no way to, said so correctly, and
         # blocked. remote_op has handled pr since 2026-11-07 — the header above explains why
@@ -840,5 +931,6 @@ class RepoGitTool(BaseTool):
         ok, payload = await remote_op(repo, op, ref, self._profile_slug,
                                       token=self.get_credential("GITHUB_TOKEN"),
                                       ticket_hint=ticket, base=base, title=title, body=body,
-                                      draft=bool(draft), commits=commits, verified=verified)
+                                      draft=bool(draft), commits=commits, verified=verified,
+                                      number=number, reason=reason)
         return ToolResult.ok(payload) if ok else ToolResult.fail(payload)
