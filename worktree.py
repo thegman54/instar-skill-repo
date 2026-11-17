@@ -30,8 +30,20 @@ log = structlog.get_logger()
 UNIT_CONVERSATION = re.compile(r"^fleet:unit:([0-9a-f-]{36})$")
 
 
-def enabled() -> bool:
-    return os.environ.get("FLEET_UNIT_WORKTREES", "off").strip().lower() == "on"
+def enabled(repo: str = "") -> bool:
+    """FLEET_UNIT_WORKTREES: 'on' = every repo; a comma list of repo names (owner/name or name)
+    = only those (the testbed first, per the plan); unset/'off' = none. With no repo given,
+    True when it is on for any repo."""
+    raw = os.environ.get("FLEET_UNIT_WORKTREES", "off").strip().lower()
+    if raw in ("", "off", "0", "false"):
+        return False
+    if raw == "on":
+        return True
+    allowed = {x.strip() for x in raw.split(",") if x.strip()}
+    if not repo:
+        return bool(allowed)
+    repo = repo.strip().lower()
+    return repo in allowed or repo.split("/")[-1] in allowed
 
 
 def tree_path(workspace_slug: str, unit_id: str, repo: str) -> str:
@@ -122,6 +134,8 @@ async def ensure_for_unit(conn, unit_id: str) -> tuple[bool, str]:
     p = await _unit_paths(conn, unit_id)
     if not p:
         return False, "the unit's repo or workspace is not configured"
+    if not enabled(p["repo"]):
+        return False, f"unit worktrees are off for {p['repo']} (FLEET_UNIT_WORKTREES)"
     import asyncio                                                      # noqa: PLC0415
     return await asyncio.to_thread(ensure, p["main"], p["tree"], p["branch"], p["base_ref"])
 
@@ -133,6 +147,8 @@ async def remove_for_unit(conn, unit_id: str) -> tuple[bool, str]:
     p = await _unit_paths(conn, unit_id)
     if not p:
         return False, "the unit's repo or workspace is not configured"
+    if not enabled(p["repo"]):
+        return False, f"unit worktrees are off for {p['repo']}"
     import asyncio                                                      # noqa: PLC0415
     return await asyncio.to_thread(remove, p["main"], p["tree"])
 

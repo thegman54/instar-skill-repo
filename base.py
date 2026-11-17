@@ -308,7 +308,7 @@ async def check_repo_access(repo: str, operation: str = "read",
     # gatekeeper URL; a caller that does not stays on the shared checkout.
     if row["workspace_slug"] and session_id and gatekeeper_url:
         from .worktree import calling_unit, enabled, tree_path       # noqa: PLC0415
-        if enabled():
+        if enabled(repo):
             unit = await calling_unit(session_id, gatekeeper_url)
             if unit:
                 tree = tree_path(row["workspace_slug"], unit, repo)
