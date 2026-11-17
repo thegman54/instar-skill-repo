@@ -125,9 +125,13 @@ class RepoBranchTool(BaseTool):
                         return ToolResult.fail(
                             f"Branch '{name}' already exists with {len(own)} commit(s) that are "
                             "on no remote; re-cutting it would lose them. Push or escalate.")
-                    if git_run(["git", "status", "--porcelain"], cwd=project_root,
-                               timeout=30).stdout.strip():
-                        return ToolResult.fail("Uncommitted changes in the checkout; re-cut refused.")
+                    # Tracked changes only. An untracked file survives a checkout untouched,
+                    # and the shared checkout collects other units' (CLC-4665 was refused over
+                    # CLC-4664's untracked repair/ folder, 2026-11-17).
+                    if git_run(["git", "status", "--porcelain", "--untracked-files=no"],
+                               cwd=project_root, timeout=30).stdout.strip():
+                        return ToolResult.fail("Uncommitted changes to tracked files in the "
+                                               "checkout; re-cut refused.")
                     cmd = ["git", "checkout", "-B", name, from_branch]
                 else:
                     cmd = ["git", "checkout", "-b", name]
