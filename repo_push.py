@@ -80,7 +80,7 @@ class RepoPushTool(BaseTool):
         # Resolved with a read-only access check so that naming an unconfigured or
         # out-of-scope repo fails here with a clear reason, rather than inside the gate.
         valid, project_root, _access, error, _branch = await check_repo_access(
-            repo, "read", self._profile_slug)
+            repo, "read", self._profile_slug, self._session_id, self._gatekeeper_url)
         if not valid:
             return ToolResult.fail(error)
 

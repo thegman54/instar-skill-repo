@@ -83,7 +83,8 @@ class RepoWriteTool(BaseTool):
         if (content is None) == (not edits):
             return ToolResult.fail("Pass exactly one of `content` (whole file) or `edits` (in place).")
 
-        valid, project_root, access, error, _ = await check_repo_access(repo, "write", self._profile_slug)
+        valid, project_root, access, error, _ = await check_repo_access(
+            repo, "write", self._profile_slug, self._session_id, self._gatekeeper_url)
         if not valid:
             return ToolResult.fail(error)
 

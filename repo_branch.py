@@ -2,6 +2,7 @@
 Repo Branch Tool - List, create, switch branches.
 """
 
+import os
 import subprocess
 
 from ..base import BaseTool, ToolResult
@@ -50,7 +51,8 @@ class RepoBranchTool(BaseTool):
 
     async def execute(self, repo: str, action: str = "list", name: str = None,
                       from_branch: str = None, ticket: str = "", **kwargs) -> ToolResult:
-        valid, project_root, access, error, _ = await check_repo_access(repo, "branch", self._profile_slug)
+        valid, project_root, access, error, _ = await check_repo_access(
+            repo, "branch", self._profile_slug, self._session_id, self._gatekeeper_url)
         if not valid:
             return ToolResult.fail(error)
 
@@ -87,6 +89,17 @@ class RepoBranchTool(BaseTool):
         valid, error = validate_project_root(project_root)
         if not valid:
             return ToolResult.fail(error)
+
+        # A UNIT'S TREE HOLDS ONE TICKET (worktree.py). Inside .units/<unit>/ the only branch
+        # is the one the tree was made on; re-cutting it is fine, moving the tree to another
+        # branch would put two tickets' work in one place again, which is what trees exist to stop.
+        if action in ("create", "switch") and name and f"{os.sep}.units{os.sep}" in project_root:
+            here = git_run(["git", "branch", "--show-current"], cwd=project_root,
+                           capture_output=True, text=True, timeout=10).stdout.strip()
+            if here and name != here:
+                return ToolResult.fail(
+                    f"This is the work tree for {here}; it cannot move to {name}. Each unit has "
+                    "its own tree, so work on another ticket happens in that unit's turn.")
 
         try:
             if action == "list":

@@ -155,7 +155,7 @@ class RepoVerifyTool(BaseTool):
         # Same scoping as every other repo tool: a profile verifies only in its own
         # workspace. Nothing new to grant, and no second authorization rule to drift.
         valid, project_root, _access, error, _branch = await check_repo_access(
-            repo, "status", self._profile_slug)
+            repo, "status", self._profile_slug, self._session_id, self._gatekeeper_url)
         if not valid:
             return ToolResult.fail(error)
 

@@ -272,7 +272,7 @@ class RepoPreflightTool(BaseTool):
 
     async def execute(self, repo: str, **kwargs) -> ToolResult:
         valid, project_root, _access, error, _branch = await check_repo_access(
-            repo, "status", self._profile_slug)
+            repo, "status", self._profile_slug, self._session_id, self._gatekeeper_url)
         if not valid:
             return ToolResult.fail(error)
         valid, error = validate_project_root(project_root)

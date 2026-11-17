@@ -188,7 +188,8 @@ READ_OPS = {"clone", "read", "list", "grep", "status", "diff", "log", "branch", 
 
 
 async def check_repo_access(repo: str, operation: str = "read",
-                            profile_slug: str = None) -> tuple[bool, str, str, str, str]:
+                            profile_slug: str = None, session_id: str = None,
+                            gatekeeper_url: str = None) -> tuple[bool, str, str, str, str]:
     """
     Check if a repo is allowed and the operation is permitted, FOR THIS PROFILE.
 
@@ -299,6 +300,20 @@ async def check_repo_access(repo: str, operation: str = "read",
         workspace_path = os.path.join(WORKSPACE_ROOT, repo)
 
     configured_branch = row["branch"]  # None if not set
+
+    # A FLEET UNIT WORKS IN ITS OWN TREE (worktree.py, FLEET_UNIT_WORKTREES=on). When the call
+    # comes from a work unit's conversation and that unit has a tree of this repo, every repo
+    # tool (read, write, branch, commit, verify) sees the tree instead of the shared checkout.
+    # Without a tree, or with the flag off, nothing changes. Callers pass their session and
+    # gatekeeper URL; a caller that does not stays on the shared checkout.
+    if row["workspace_slug"] and session_id and gatekeeper_url:
+        from .worktree import calling_unit, enabled, tree_path       # noqa: PLC0415
+        if enabled():
+            unit = await calling_unit(session_id, gatekeeper_url)
+            if unit:
+                tree = tree_path(row["workspace_slug"], unit, repo)
+                if os.path.exists(os.path.join(tree, ".git")):
+                    workspace_path = tree
 
     # Check blocked paths
     resolved = str(Path(workspace_path).resolve())
