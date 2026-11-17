@@ -105,6 +105,16 @@ def remove(main: str, tree: str) -> tuple[bool, str]:
     if r.returncode != 0:
         return False, f"git worktree remove failed: {(r.stderr or r.stdout).strip()[:300]}"
     _git(main, "worktree", "prune")
+    # git removes the tree, not the folders above it. Drop the now-empty ones up to and including
+    # .units/<unit>: the runner treats an existing unit folder as "start here" (testbed proof,
+    # 2026-11-17, left .units/<unit>/repos/<owner>/ behind). Stops at the first non-empty folder.
+    path = os.path.dirname(tree)
+    while "/.units/" in path + "/" and not path.endswith("/.units"):
+        try:
+            os.rmdir(path)
+        except OSError:
+            break
+        path = os.path.dirname(path)
     log.info("unit_worktree_removed", tree=tree)
     return True, "removed"
 
