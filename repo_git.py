@@ -814,7 +814,19 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
     # that needs history rewritten has a problem a force push would hide.
     cmd = ["push", auth, f"{ref}:{ref}"]
     if ref.startswith(RELEASE_PREFIX) or bot_ticket(ref)[1]:
-        cmd.insert(1, "--force-with-lease")
+        # THE LEASE NEEDS AN EXPLICIT EXPECTED VALUE. A bare --force-with-lease compares with
+        # the remote-tracking ref, and a push to an authenticated URL has none, so git refused
+        # every push to a bot branch that already existed on GitHub: "! [rejected] (stale
+        # info)" (CLC-4665, 2026-11-18: the dev's fix c04c75f3 could not reach PR #270, two
+        # fetches did not help). The expected value is what the remote holds right now, read
+        # over the same URL; a branch the remote does not have yet is leased as absent.
+        ls = git_run(["git", "-C", path, "ls-remote", auth, f"refs/heads/{ref}"],
+                     capture_output=True, text=True, timeout=60)
+        if ls.returncode != 0:
+            return False, (f"could not read {ref} on the remote to lease it: "
+                           f"{scrub(ls.stderr or '')[-300:]}")
+        expect = (ls.stdout.split() or [""])[0]
+        cmd.insert(1, f"--force-with-lease=refs/heads/{ref}:{expect}")
 
     r = git_run(["git", "-C", path, *cmd], capture_output=True, text=True,
                        timeout=300)
