@@ -80,6 +80,16 @@ def ensure(main: str, tree: str, branch: str, base_ref: str) -> tuple[bool, str]
         return False, f"no checkout at {main}"
     _git(main, "worktree", "prune")
     elsewhere = _branch_checked_out_at(main, branch)
+    # THE SHARED CHECKOUT HOLDING THE BRANCH is the normal case when worktrees are switched on
+    # for a repo that was worked the old way (2026-11-18: entity-feature-data-loaders sat on
+    # bot/CLC-4555). A CLEAN shared checkout is detached at the same commit to free the branch:
+    # nothing is lost, and the branch's commits move into the unit's tree. A dirty one is left
+    # alone and refused below, because its uncommitted work belongs to whoever made it.
+    if elsewhere and os.path.realpath(elsewhere) == os.path.realpath(main):
+        dirty = _git(main, "status", "--porcelain", "--untracked-files=no").stdout.strip()
+        if not dirty and _git(main, "checkout", "--detach").returncode == 0:
+            log.info("unit_worktree_freed_branch", main=main, branch=branch)
+            elsewhere = ""
     if elsewhere and os.path.realpath(elsewhere) != os.path.realpath(tree):
         return False, (f"{branch} is checked out at {elsewhere}; switch that checkout off it "
                        "before the unit can have its own tree")
