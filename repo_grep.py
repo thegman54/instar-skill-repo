@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import git_env, check_repo_access, validate_project_root
+from .base import git_env, check_repo_access, validate_project_root, checkout_staleness
 
 
 @register_tool
@@ -71,8 +71,12 @@ class RepoGrepTool(BaseTool):
                 env=git_env()
             )
 
+            stale = checkout_staleness(project_root)
             if result.returncode == 1:
-                return ToolResult.ok({"pattern": pattern, "matches": 0, "results": ""})
+                out = {"pattern": pattern, "matches": 0, "results": ""}
+                if stale:
+                    out["checkout_warning"] = stale
+                return ToolResult.ok(out)
             if result.returncode != 0:
                 return ToolResult.fail(f"Search error: {result.stderr}")
 
@@ -90,9 +94,10 @@ class RepoGrepTool(BaseTool):
                 output = output[:50000]
                 truncated = True
 
-            return ToolResult.ok({
-                "pattern": pattern, "matches": total_matches,
-                "truncated": truncated, "results": output,
-            })
+            out = {"pattern": pattern, "matches": total_matches,
+                   "truncated": truncated, "results": output}
+            if stale:
+                out["checkout_warning"] = stale
+            return ToolResult.ok(out)
         except Exception as e:
             return ToolResult.fail(f"Search error: {str(e)}")

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import check_repo_access, validate_path, validate_project_root
+from .base import check_repo_access, validate_path, validate_project_root, checkout_staleness
 
 
 @register_tool
@@ -68,7 +68,8 @@ class RepoReadTool(BaseTool):
 
         file_path = Path(abs_path)
         if not file_path.exists():
-            return ToolResult.fail(f"File not found: {path}")
+            stale = checkout_staleness(project_root)
+            return ToolResult.fail(f"File not found: {path}" + (f" ({stale})" if stale else ""))
         if not file_path.is_file():
             return ToolResult.fail(f"Not a file: {path}")
 

@@ -395,3 +395,41 @@ def validate_project_root(project_root: str) -> tuple[bool, str]:
         return False, f"Project path is not a directory: {project_root}"
 
     return True, ""
+
+
+# A shared checkout older than this is flagged on every read. 30 minutes: long enough that a
+# busy session is not nagged, short enough that a day-old checkout never passes as current.
+STALE_CHECKOUT_SECONDS = int(os.environ.get("REPO_STALE_CHECKOUT_SECONDS", "1800"))
+
+
+def checkout_staleness(project_root: str) -> str:
+    """A warning when the checkout a read just searched may not be current, else "".
+
+    WHY (2026-11-19, CLC-4683). The coordinator grepped the shared EFDL checkout for
+    ExternalAssetUpsert, found nothing, and told Alex "no class named ExternalAssetUpsert
+    exists anywhere in the repo". It had been on production for 15 hours; the checkout had
+    not been synced since before the merge. Three minutes later her own repo_clone pulled it
+    and the same read succeeded. A read cannot tell "absent" from "not pulled yet" unless it
+    says how old the checkout is. Local facts only (no network): last fetch time, and commits
+    the branch is behind its remote as of that fetch."""
+    try:
+        git_dir = Path(project_root) / ".git"
+        if git_dir.is_file():                       # a worktree: .git points at the real dir
+            return ""
+        mark = next((p for p in (git_dir / "FETCH_HEAD", git_dir / "HEAD") if p.exists()), None)
+        if mark is None:
+            return ""
+        import time                                                     # noqa: PLC0415
+        age = int(time.time() - mark.stat().st_mtime)
+        behind = git_run(["git", "rev-list", "--count", "HEAD..@{upstream}"],
+                         cwd=project_root, timeout=10)
+        n = int(behind.stdout.strip()) if behind.returncode == 0 and behind.stdout.strip().isdigit() else 0
+        if n == 0 and age < STALE_CHECKOUT_SECONDS:
+            return ""
+        parts = [f"this checkout was last synced {age // 60} minute(s) ago"]
+        if n:
+            parts.append(f"it is {n} commit(s) behind its remote branch")
+        return ("; ".join(parts) + ". A miss here may be code merged since: call repo_clone "
+                "to refresh before saying something does not exist.")
+    except Exception:                                                   # noqa: BLE001
+        return ""
