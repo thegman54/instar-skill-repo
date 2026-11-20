@@ -60,6 +60,46 @@ def _provably_exact(wt: str, path: str, verified: str, ticket: str) -> tuple:
                    f"{first[:8]}, so {verified}'s version would carry other work")
 
 
+def _ticket_gaps(wt: str, ticket: str, env: str, verified: str, commits: list) -> dict:
+    """What of the ticket's VERIFIED work the landing would leave out. {} when nothing.
+
+    Two silent omissions this catches (fleet deficiencies #85 and #89):
+    - CLC-4665, 2026-11-19: the coordinator passed only the rework commit c04c75f3, not the
+      first commit 9578dca6 it sits on, so the pick conflicted for a reason nobody could see.
+    - CLC-4729, 2026-11-19: testing's copy of the ticket included AkexpeditionscruisesMapRule.cs,
+      added by a hand resolution in a commit outside the unit's list. land resolved Program.cs
+      from testing (which drops the rules line) and pushed a branch with no rule file, so
+      relink-maps on staging would have skipped A&K.
+    A commit counts as already on <env> when <env> has a commit with the same subject.
+    """
+    ours = {c[:7] for c in commits}
+    on_verified = _git(wt, "log", "--no-merges", "--format=%H%x09%s", f"--grep={ticket}",
+                       f"origin/{verified}").stdout.splitlines()
+    on_env = set(_git(wt, "log", "--no-merges", "--format=%s", f"--grep={ticket}",
+                      f"origin/{env}").stdout.splitlines())
+    picked = set(_git(wt, "log", "--no-merges", "--format=%s", f"--grep={ticket}",
+                      "HEAD").stdout.splitlines())
+    missing_commits, ticket_files = [], set()
+    for line in on_verified:
+        sha, _, subj = line.partition("\t")
+        ticket_files.update(_git(wt, "show", "--name-only", "--format=", sha).stdout.split())
+        if sha[:7] in ours or subj in on_env or subj in picked:
+            continue
+        missing_commits.append({"sha": sha[:12], "subject": subj[:120]})
+    missing_files = []
+    for f in sorted(ticket_files):
+        want = _blob(wt, f"origin/{verified}:{f}")
+        have = _blob(wt, f"HEAD:{f}")
+        if want and not have:
+            missing_files.append({"path": f, "state": f"on {verified}, absent from the landing"})
+    out = {}
+    if missing_commits:
+        out["missing_commits"] = missing_commits
+    if missing_files:
+        out["missing_files"] = missing_files
+    return out
+
+
 def _conflict_report(wt: str, paths: list) -> list:
     out = []
     for p in paths:
@@ -138,6 +178,17 @@ async def land(path: str, auth: str, scrub, env: str, ticket: str, commits: list
             }
 
         head = _git(wt, "rev-parse", "HEAD").stdout.strip()
+        gaps = _ticket_gaps(wt, ticket, env, verified, commits) if verified else {}
+        if gaps:
+            return False, {
+                "error": (f"the landing would leave out {ticket} work that is on {verified}. "
+                          "Nothing was pushed."),
+                **gaps,
+                "next": ("Add the missing commits to `commits` (in order) and re-run land. A file "
+                         "listed under missing_files with no missing commit was added on "
+                         f"{verified} by a hand resolution: land cannot carry it, so ask the "
+                         "person who resolved it (often a <Line>MapRule.cs next to a loader)."),
+            }
         files = _git(wt, "diff", "--name-only", base, head).stdout.split()
         compare = []
         for f in files:
