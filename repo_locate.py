@@ -50,13 +50,18 @@ import structlog
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import git_env, check_repo_access, validate_project_root, ACCESS_LEVELS
+from .base import git_env, check_repo_access, validate_project_root, checkout_staleness, ACCESS_LEVELS
 
 log = structlog.get_logger()
 
 # One ls-files and one grep per repository, so the cost is linear in repos and not in
 # repos × terms. Everything else is string work in here.
-MAX_REPOS = 40
+# CLC-4785 (2026-11-24): this was 40 and the cut was SILENT. Adding 44 dpov-scraper repos
+# pushed the list to 72, alphabetical order put entity-feature-data-loaders at 59, and the
+# verdict told the coordinator ItineraryMapLinker and LoadGuard "do not exist yet" — both on
+# production for days, in a repo that was never searched. The cap stays as a cost bound, but
+# the core repos are searched first (scrapers last) and anything cut is reported by name.
+MAX_REPOS = 90
 # Separate caps because the two kinds cost differently. A path is matched in memory against
 # `git ls-files` output, so twenty of them are free; an identifier becomes a `-e` argument to
 # one grep. CLC-4555 names twenty-five paths across two repositories, and a single cap of 16
@@ -255,6 +260,7 @@ class RepoLocateTool(BaseTool):
 
         sem = asyncio.Semaphore(CONCURRENCY)
         unreachable = []
+        stale = []
 
         async def one(repo: str):
             ok, root, access, err, _ = await check_repo_access(repo, "grep", self._profile_slug)
@@ -266,8 +272,12 @@ class RepoLocateTool(BaseTool):
                 unreachable.append({"repo": repo, "why": err})
                 return None
             async with sem:
+                warning = await asyncio.to_thread(checkout_staleness, root)
+                if warning:
+                    stale.append({"repo": repo, "warning": warning})
                 return await asyncio.to_thread(self._search, repo, root, wanted)
 
+        not_searched = candidates[MAX_REPOS:]
         found = [r for r in await asyncio.gather(*[one(r) for r in candidates[:MAX_REPOS]])
                  if r and r["score"] > 0]
         found.sort(key=lambda r: -r["score"])
@@ -318,8 +328,12 @@ class RepoLocateTool(BaseTool):
             "found_nowhere": missing,
             "paths_that_did_not_resolve": unresolved_paths[:10],
             "unreachable": unreachable[:8],
-            "verdict": self._verdict(destinations, references, missing),
+            "verdict": self._verdict(destinations, references, missing, stale, not_searched),
         }
+        if not_searched:
+            out["not_searched"] = not_searched
+        if stale:
+            out["checkout_warnings"] = stale[:8]
         log.info("repo_locate", ticket=ticket or None, terms=len(wanted),
                  repos=len(candidates[:MAX_REPOS]), destinations=len(destinations))
         return ToolResult.ok(out)
@@ -415,7 +429,8 @@ class RepoLocateTool(BaseTool):
                             or r["matches"][:4]}
 
     @staticmethod
-    def _verdict(destinations: list, references: list, missing: list) -> str:
+    def _verdict(destinations: list, references: list, missing: list, stale: list = (),
+                 not_searched: list = ()) -> str:
         parts = []
         if not destinations:
             parts.append(
@@ -442,7 +457,22 @@ class RepoLocateTool(BaseTool):
                 "Reference material (documentation hits only, NOT where the work goes): " +
                 "; ".join(f"{r['repo']} → {', '.join(r['files'][:2])}" for r in references[:3]) +
                 ". Attach it to the unit — it is what the dev would otherwise be missing.")
-        if missing:
+        # "Does not exist" is only claimed when every repo was searched and every checkout is
+        # current. A miss over the cap (CLC-4785) or in a stale checkout (CLC-4683, the same
+        # warning repo_grep carries) is "not looked at" or "not pulled", not absent.
+        if missing and not_searched:
+            parts.append(
+                f"Found in none of the repositories searched: {', '.join(missing[:8])}. NOT "
+                f"proof they do not exist: {len(not_searched)} repositories were over the "
+                f"search cap and not searched ({', '.join(not_searched[:6])}). Pass `repos` "
+                f"to search the ones that matter before calling any of this new code.")
+        elif missing and stale:
+            parts.append(
+                f"Found in no repository searched: {', '.join(missing[:8])}. NOT proof they do "
+                f"not exist: {len(stale)} checkout(s) are stale "
+                f"({', '.join(s['repo'] for s in stale[:4])}). Call repo_clone on them and "
+                f"search again before calling any of this new code.")
+        elif missing:
             parts.append(
                 f"Found in no repository at all: {', '.join(missing[:8])}. These do not exist "
                 f"yet, so that part of the ticket is new code rather than a change.")
@@ -480,6 +510,9 @@ class RepoLocateTool(BaseTool):
             return []
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT repo, access FROM skill_repo_config WHERE enabled ORDER BY repo")
+                # Scraper repos last: there are dozens, one per cruise line, and they hold the
+                # scraped feeds, not the code most tickets change.
+                "SELECT repo, access FROM skill_repo_config WHERE enabled "
+                "ORDER BY (repo LIKE '%/dpov-scraper-%'), repo")
         return [r["repo"] for r in rows
                 if "grep" in ACCESS_LEVELS.get(r["access"], set())]
