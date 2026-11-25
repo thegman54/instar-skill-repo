@@ -70,7 +70,10 @@ if not os.path.exists(pol_path):
     sys.exit(0)
 pol = json.load(open(pol_path))
 remote = pol.get("remote") or "origin"
-testing = pol.get("testing_branch")
+# argv[2]: the environment branch to trial-merge into (One Track: testing OR staging, since
+# a ticket goes to staging by the same merge). argv[3]: production, to name what is in flight.
+testing = (sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else pol.get("testing_branch"))
+prod = (sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else pol.get("prod_branch")) or ""
 verify = pol.get("verify") or []
 if not testing:
     print(json.dumps({"error": "policy names no testing_branch"}))
@@ -149,6 +152,20 @@ try:
         out["merges_clean"] = False
         out["conflicts"] = sorted({p for _k, p in named} | set(indexed))
         out["conflict_kinds"] = sorted({k for k, _p in named})
+        # WHO IS ON THE OTHER SIDE. A conflict with an environment is a conflict with work
+        # that is on it and not yet on production: name those tickets and authors, so the
+        # answer is "CLC-4673 changed this file on staging", not "it conflicts".
+        others = {}
+        if prod:
+            for p in out["conflicts"][:20]:
+                log_ = subprocess.run(["git", "log", "--no-merges", "--format=%an%x09%s",
+                                       remote_name + "/" + prod + ".." + tip, "--", p],
+                                      capture_output=True, text=True).stdout.splitlines()
+                others[p] = {
+                    "tickets": sorted({k for l in log_ for k in
+                                       re.findall(r"\b[A-Z]{2,10}-\d+\b", l.split("\t", 1)[-1].upper())}),
+                    "authors": sorted({l.split("\t", 1)[0] for l in log_ if l})}
+        out["conflict_with"] = others
         # A merge can fail WITHOUT a conflict — a broken object store, a missing ref, no
         # disk. Saying so is the difference between "fix your branch" and "fix the machine".
         if not out["conflicts"]:
@@ -248,13 +265,15 @@ class RepoPreflightTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return ("Fetch the testing branch, merge this repository's current bot branch into "
-                "it in a throwaway worktree, and run the repo's own build against the MERGED "
+        return ("Fetch an environment branch (env=testing, the default, or staging), merge "
+                "this repository's current bot branch into it in a throwaway worktree, and run the repo's own build against the MERGED "
                 "result. Answers two things an attestation of the bot branch alone cannot: "
                 "whether it lands without conflict, and whether what lands actually builds. "
                 "It merges nothing for real, pushes nothing, records no attestation, and "
-                "leaves the checkout untouched. The answer is only true for the testing "
-                "commit it ran against, which is in the result — re-run it if testing moves.")
+                "leaves the checkout untouched. On a conflict it names the tickets and authors "
+                "on the other side (in flight on that environment, not yet on production). "
+                "The answer is only true for the commit it ran against — re-run it if the "
+                "environment moves.")
 
     @property
     def input_schema(self) -> dict:
@@ -263,6 +282,8 @@ class RepoPreflightTool(BaseTool):
             "properties": {
                 "repo": {"type": "string",
                          "description": "Repository in owner/repo format"},
+                "env": {"type": "string", "enum": ["testing", "staging"],
+                        "description": "The environment to trial-merge into. Default testing."},
             },
             "required": ["repo"],
         }
@@ -270,7 +291,7 @@ class RepoPreflightTool(BaseTool):
     def credential_keys(self) -> list[str]:
         return []
 
-    async def execute(self, repo: str, **kwargs) -> ToolResult:
+    async def execute(self, repo: str, env: str = "testing", **kwargs) -> ToolResult:
         valid, project_root, _access, error, _branch = await check_repo_access(
             repo, "status", self._profile_slug, self._session_id, self._gatekeeper_url)
         if not valid:
@@ -287,9 +308,17 @@ class RepoPreflightTool(BaseTool):
         testing_branch, policy_err = _testing_branch(repo)
         if policy_err:
             return ToolResult.fail(policy_err)
+        env = (env or "testing").strip()
+        if env not in ("testing", "staging"):
+            return ToolResult.fail("env is testing or staging")
+        from .repo_land import _policy_value                           # noqa: PLC0415
+        if env == "staging":
+            testing_branch = _policy_value(repo, "staging_branch", "")
+            if not testing_branch:
+                return ToolResult.fail(f"the branch policy for {repo} names no staging_branch")
+        prod_branch = _policy_value(repo, "prod_branch", "")
         from .repo_git import remote_op
-        ok, payload = await remote_op(repo, "fetch", ref=testing_branch,
-                                      profile_slug=self._profile_slug or "")
+        ok, payload = await remote_op(repo, "fetch", profile_slug=self._profile_slug or "")
         if not ok:
             return ToolResult.fail(
                 f"could not fetch {testing_branch}: {payload}. Nothing was merged and "
@@ -298,7 +327,7 @@ class RepoPreflightTool(BaseTool):
 
         runner = await _runner_for(self._profile_slug or "")
         cmd = ["docker", "exec", "-i", "-u", RUNNER_USER, runner,
-               "python3", "-", project_root]
+               "python3", "-", project_root, testing_branch, prod_branch]
         try:
             proc = await asyncio.get_running_loop().run_in_executor(
                 None,
@@ -331,34 +360,36 @@ class RepoPreflightTool(BaseTool):
         clean = data.get("merges_clean")
         builds = data.get("merged_builds_clean")
         if clean and builds:
-            verdict = ("LANDS CLEAN AND THE MERGED RESULT BUILDS, against testing at %s. "
+            verdict = ("LANDS CLEAN AND THE MERGED RESULT BUILDS, against %s at %s. "
                        "This is advice, not an attestation: it is true for that commit and "
-                       "stops being true when testing moves."
-                       % data.get("testing_sha", "?"))
+                       "stops being true when %s moves."
+                       % (testing_branch, data.get("testing_sha", "?"), testing_branch))
         elif clean and builds is False:
             verdict = ("MERGES WITHOUT CONFLICT BUT THE MERGED RESULT DOES NOT BUILD. The "
                        "branch builds alone and the combination does not, which is what a "
                        "bot-branch attestation cannot see — usually one side renamed what "
                        "the other side calls. Do not promote this; fix it on the branch.")
         elif clean is False:
-            verdict = ("CONFLICTS WITH TESTING in %d file(s): %s. git-gate would abort the "
-                       "promotion whole and leave testing untouched, so nothing is at risk "
-                       "— but it cannot be promoted until the branch is updated. If an "
-                       "earlier round of this ticket already reached testing (as "
-                       "cherry-picks), that is the usual cause: do NOT merge testing into "
-                       "the bot branch. The expert cuts bot/<TICKET>-testing from testing, "
-                       "cherry-picks only the commits testing lacks (where_is lists which "
-                       "landed) and pushes it, without git-gate verify; preflight THAT branch "
-                       "(it is the build evidence) and open the testing PR from it."
-                       % (len(data.get("conflicts") or []),
-                          ", ".join((data.get("conflicts") or [])[:12])))
+            cw = data.get("conflict_with") or {}
+            named = "; ".join(
+                f"{p}: {', '.join(v.get('tickets') or []) or 'no ticket named'}"
+                f" ({', '.join(v.get('authors') or []) or '?'})" for p, v in list(cw.items())[:8])
+            verdict = ("CONFLICTS WITH %s in %d file(s): %s. The other side is work on %s that "
+                       "is not on production yet: %s. Never merge %s into the bot branch and "
+                       "never rebase it. `repo_git op=land` records each conflict for a "
+                       "recipe (repo_recipe) a person approves; a file changed by someone "
+                       "outside the fleet is a person's decision. If the conflict is with "
+                       "production itself, `repo_git op=update_base` first."
+                       % (testing_branch.upper(), len(data.get("conflicts") or []),
+                          ", ".join((data.get("conflicts") or [])[:12]), testing_branch,
+                          named or "not determined", testing_branch))
         else:
             verdict = ("The merge was clean and no build ran, so whether the merged result "
                        "compiles is UNOBSERVED. Check the policy's verify commands.")
 
         if data.get("already_in_testing"):
-            verdict = ("This branch is already contained in testing at %s — there is nothing "
-                       "to land. " % data.get("testing_sha", "?")) + verdict
+            verdict = ("This branch is already contained in %s at %s — there is nothing "
+                       "to land. " % (testing_branch, data.get("testing_sha", "?"))) + verdict
         if data.get("uncommitted_changes"):
             verdict += (" NOTE: the checkout has uncommitted changes, which were NOT part of "
                         "this merge. What was tested is the committed branch.")
@@ -370,7 +401,9 @@ class RepoPreflightTool(BaseTool):
             "testing_branch": data.get("testing_branch"),
             "testing_sha": data.get("testing_sha"),
             "merges_clean": clean,
+            "env": env,
             "conflicts": data.get("conflicts") or [],
+            "conflict_with": data.get("conflict_with") or {},
             "merged_builds_clean": builds,
             "merged_build": data.get("merged_build") or [],
             "node_modules": data.get("node_modules", ""),
