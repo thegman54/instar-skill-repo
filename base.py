@@ -433,3 +433,28 @@ def checkout_staleness(project_root: str) -> str:
                 "to refresh before saying something does not exist.")
     except Exception:                                                   # noqa: BLE001
         return ""
+
+
+# A ref names a commit the caller wants read: a branch (origin/production, bot/CLC-4755), a tag,
+# a sha, with ^/~ suffixes. Never an option (leading "-") and never `ref:path` syntax.
+_REF_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/@{}^~-]{0,199}$")
+
+
+def validate_ref(project_root: str, ref: str) -> tuple[bool, str]:
+    """(ok, error) for one ref, checked against this checkout's object store.
+
+    WHY (2026-11-24). repo_read and repo_diff could only see the files on disk, and the shared
+    checkout sits on whatever branch the dev bot last worked. A CLC-4755 review read pre-fix
+    code because the checkout was on bot/CLC-4644-testing; switching branches is refused while
+    a unit's worktree holds the branch. Branches are shared by every worktree of a repo, so
+    reading at a ref needs no switch at all.
+    """
+    if not ref or not _REF_RE.match(ref) or ".." in ref:
+        return False, (f"Invalid ref {ref!r}: a branch, tag or commit, e.g. origin/production, "
+                       "bot/CLC-4755, 1438db54")
+    r = git_run(["git", "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"],
+                cwd=project_root, timeout=15)
+    if r.returncode != 0:
+        return False, (f"Ref {ref!r} is not in this checkout. Remote branches are origin/<name>; "
+                       "call repo_clone to fetch if it was pushed recently.")
+    return True, ""

@@ -6,7 +6,7 @@ import subprocess
 
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
-from .base import git_env, check_repo_access, validate_project_root
+from .base import git_env, check_repo_access, validate_project_root, validate_ref
 
 
 @register_tool
@@ -19,7 +19,9 @@ class RepoDiffTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Show git diff — unstaged changes by default, or staged changes with the staged flag."
+        return ("Show git diff — unstaged changes by default, or staged changes with the staged "
+                "flag. Pass `base` (and optionally `head`) to diff branches or commits instead, "
+                "e.g. base=origin/production head=bot/CLC-4755: what that branch changes.")
 
     @property
     def input_schema(self) -> dict:
@@ -29,6 +31,13 @@ class RepoDiffTool(BaseTool):
                 "repo": {"type": "string", "description": "Repository in owner/repo format"},
                 "staged": {"type": "boolean", "description": "Show staged changes instead of unstaged (default: false)"},
                 "path": {"type": "string", "description": "Limit diff to specific file or directory"},
+                "base": {"type": "string",
+                         "description": ("Branch or commit to diff FROM (optional), e.g. "
+                                         "origin/production. Alone: the checkout's files vs base")},
+                "head": {"type": "string",
+                         "description": ("Branch or commit to diff TO (needs base), e.g. "
+                                         "bot/CLC-4755. Shows what head changed since it left "
+                                         "base (git diff base...head)")},
             },
             "required": ["repo"],
         }
@@ -36,7 +45,8 @@ class RepoDiffTool(BaseTool):
     def credential_keys(self) -> list[str]:
         return []
 
-    async def execute(self, repo: str, staged: bool = False, path: str = None, **kwargs) -> ToolResult:
+    async def execute(self, repo: str, staged: bool = False, path: str = None,
+                      base: str = None, head: str = None, **kwargs) -> ToolResult:
         valid, project_root, access, error, _ = await check_repo_access(
             repo, "diff", self._profile_slug, self._session_id, self._gatekeeper_url)
         if not valid:
@@ -46,10 +56,24 @@ class RepoDiffTool(BaseTool):
         if not valid:
             return ToolResult.fail(error)
 
+        if head and not base:
+            return ToolResult.fail("head needs base: the diff is what head changed since base")
+        for ref in (base, head):
+            if ref:
+                ok, error = validate_ref(project_root, ref)
+                if not ok:
+                    return ToolResult.fail(error)
+
         try:
             cmd = ["git", "diff", "--no-color"]
-            if staged:
-                cmd.append("--cached")
+            if head:
+                # Three dots: the branch's own changes, not everything base gained since the cut.
+                cmd.append(f"{base}...{head}")
+            else:
+                if staged:
+                    cmd.append("--cached")
+                if base:
+                    cmd.append(base)
             if path:
                 cmd.extend(["--", path])
 
@@ -65,7 +89,7 @@ class RepoDiffTool(BaseTool):
                 output = output[:max_chars]
 
             return ToolResult.ok({
-                "staged": staged, "diff": output,
+                "staged": staged, "base": base or "", "head": head or "", "diff": output,
                 "truncated": truncated, "empty": not output.strip(),
             })
         except subprocess.TimeoutExpired:
