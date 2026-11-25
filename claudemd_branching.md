@@ -27,7 +27,7 @@ Your change needs code that isn't on production yet when:
 - the ticket's own text says it builds on unshipped work.
 
 Then do not build on top of it, and do not copy it. Move the unit to `waiting` and name
-the ticket(s) it waits for (`fleet_unit_update state=waiting blocked_by=[CLC-...]`).
+the ticket(s) it waits for (`fleet_unit_update state=waiting waiting_on=[CLC-...]`).
 The fleet resumes you when they reach production. Your first step then is `repo_git op=update_base`.
 
 ## Landing on testing or staging
