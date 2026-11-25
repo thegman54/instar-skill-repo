@@ -31,8 +31,8 @@ the ticket(s) it waits for (`fleet_unit_update state=waiting blocked_by=[CLC-...
 The fleet resumes you when they reach production. Your first step then is `repo_git op=update_base`.
 
 ## Landing on testing or staging
-`repo_preflight` merges your branch into testing AND staging in a scratch tree, builds the result,
-and reports per environment:
+`repo_preflight env=testing` (and `env=staging` before a staging landing) merges your branch into
+that environment in a scratch tree, builds the result, and reports:
 - **clean**: `repo_git op=land ref=<env>` opens the PR from `bot/CLC-<n>` itself. A person merges it.
 - **conflict**: preflight names the file, the hunk, and the ticket(s) whose unshipped commits touch it.
   - If an approved recipe covers that file and ticket, `land` applies it in a landing MERGE on
@@ -49,7 +49,7 @@ your ticket did not change is wrong, and `land` refuses it.
 
 ## Production
 The fleet never merges to production. A production PR's head is `bot/CLC-<n>`: the same branch
-and commits that landed on staging. `repo_git op=pr ref=production` refuses anything else. If
+and commits that landed on staging. `repo_git op=pr base=<production branch>` refuses anything else, and anything not already on staging. If
 production moved and the PR conflicts, `update_base` (merge), apply the recipe, and land again.
 
 ## Path fence (shared repos)
