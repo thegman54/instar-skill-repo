@@ -2,6 +2,7 @@
 Repo Commit Tool - Stage and commit changes.
 """
 
+import re
 import subprocess
 
 from ..base import BaseTool, ToolResult
@@ -58,6 +59,19 @@ class RepoCommitTool(BaseTool):
                 return ToolResult.fail(f"Invalid path '{f}': {error}")
             validated_files.append(f)
 
+        # ONE TRACK FENCE (fleet triage 2026-11-25). In a shared repo the policy names the
+        # paths the fleet works in; a file outside them is another team's, and the time to
+        # stop is before it is committed, not when the landing refuses the branch.
+        from .base import branching_policy, path_in_fence                # noqa: PLC0415
+        policy, _problems = branching_policy(repo)
+        outside = [f for f in validated_files
+                   if not path_in_fence(f.lstrip("./"), policy.get("fleet_paths") or [])]
+        if outside:
+            return ToolResult.fail(
+                f"{', '.join(outside)} is outside the paths the fleet works in for {repo} "
+                f"({', '.join(policy['fleet_paths'])}). Those belong to other developers: "
+                "escalate instead of changing them.")
+
         try:
             stage_result = git_run(["git", "add", "--"] + validated_files,
                 cwd=project_root, capture_output=True, text=True, timeout=30,
@@ -72,6 +86,13 @@ class RepoCommitTool(BaseTool):
             ident = await git_author(self._profile_slug)
             full_message = (f"{message}\n\nCo-Authored-By: {ident['GIT_AUTHOR_NAME']} "
                             f"<{ident['GIT_AUTHOR_EMAIL']}>")
+            # The ownership mark a landing checks (One Track R1/R6): every commit made through
+            # the fleet carries it, so "is this hunk the fleet's" is read from the commit, not
+            # guessed from an author name a person could share.
+            branch = git_run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=project_root,
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+            ticket = (re.match(r"bot/([A-Z]{2,10}-\d+)", branch) or [None, ""])[1]
+            full_message += f"\nFleet-Unit: {ticket or branch} ({self._profile_slug})"
             # Identity on the commit call only — staging and rev-parse do not need one.
             commit_result = git_run(["git", "commit", "-m", full_message],
                 cwd=project_root, capture_output=True, text=True, timeout=30,
