@@ -1,4 +1,11 @@
 """
+repo_land — land a ticket on testing or staging.
+
+ONE TRACK (fleet triage 2026-11-25, D15): `land` merges the ticket's OWN branch (land_merge) whenever
+the repo's policy allows it and drift is 0. The cherry-pick path below (land_own_commits) is the
+fallback for drift above 0 or a repo on safest settings.
+
+The original module note, for the fallback:
 repo_land — cut an environment's LANDING branch and cherry-pick a ticket's commits onto it.
 
 WHY. CLC-4615, 2026-11-16: the staging delivery needed bot/CLC-4615-staging, cut from staging
@@ -100,6 +107,16 @@ def _ticket_gaps(wt: str, ticket: str, env: str, verified: str, commits: list) -
     return out
 
 
+def _push_landing(path: str, auth: str, landing: str):
+    """Push a landing branch with an EXPLICIT lease: the remote must still be at what we fetched
+    (or must not exist yet). A bare --force-with-lease compares against a remote-tracking ref,
+    and a push to a URL (how this skill pushes, with its token) has none, so once the branch
+    existed every re-land failed with "(stale info)": CLC-4620, 2026-11-24, three attempts."""
+    seen = _blob(path, f"refs/remotes/origin/{landing}")
+    return git_run(["git", "-C", path, "push", f"--force-with-lease={landing}:{seen}", auth,
+                    f"{landing}:{landing}"], timeout=300)
+
+
 def _conflict_report(wt: str, paths: list) -> list:
     out = []
     for p in paths:
@@ -108,10 +125,11 @@ def _conflict_report(wt: str, paths: list) -> list:
     return out
 
 
-async def land(path: str, auth: str, scrub, env: str, ticket: str, commits: list,
-               verified: str, profile_slug: str) -> tuple:
-    """(ok, payload). The caller has already checked access and that bot/<ticket>-<env> may
-    be pushed."""
+async def land_own_commits(path: str, auth: str, scrub, env: str, ticket: str, commits: list,
+                           verified: str, profile_slug: str) -> tuple:
+    """(ok, payload). The OWN-COMMITS fallback (One Track): used only when the repo's policy
+    says own_commits, or `auto` measured drift above 0 (or could not measure it). The caller
+    has already checked access and that bot/<ticket>-<env> may be pushed."""
     if env not in ENVS:
         return False, f"land targets testing or staging, not {env!r}"
     commits = [c.strip().lower() for c in (commits or []) if c and c.strip()]
@@ -201,8 +219,7 @@ async def land(path: str, auth: str, scrub, env: str, ticket: str, commits: list
         git_run(["git", "-C", path, "worktree", "remove", "--force", wt])
         shutil.rmtree(wt, ignore_errors=True)
 
-    r = git_run(["git", "-C", path, "push", "--force-with-lease", auth, f"{landing}:{landing}"],
-                timeout=300)
+    r = _push_landing(path, auth, landing)
     if r.returncode != 0:
         return False, f"push of {landing} failed: {scrub((r.stderr or '') + (r.stdout or ''))[-400:]}"
     return True, {
@@ -212,3 +229,245 @@ async def land(path: str, auth: str, scrub, env: str, ticket: str, commits: list
         "next": (f"Pushed {landing}. Nothing was built here: the dev (or repo_verify) builds it "
                  f"before the PR merges. Open the PR with op=pr ref={landing} base={env}."),
     }
+
+
+# ================================================================ One Track: land by MERGE
+# (fleet triage 2026-11-25; design https://claude.ai/artifact/UxkPf9KreaSy8odKJtaRoD, R2/R6, D15)
+#
+# The ticket's OWN commits go to every environment: a clean merge means the PR is opened from
+# bot/<TICKET> itself. A conflict is resolved only by an approved recipe for that EXACT conflict
+# (repo_conflict_recipes), applied in a merge on bot/<TICKET>-<env>, a branch that only ever
+# holds that merge. In a shared repo, a hunk last changed by anyone outside the fleet is never
+# resolved here: it stops and names them.
+
+FLEET_TRAILER = "Fleet-Unit:"
+TICKET_KEY_RE = re.compile(r"\b[A-Z]{2,10}-\d+\b")
+
+
+def _policy_value(repo: str, key: str, default: str = "") -> str:
+    import json                                                         # noqa: PLC0415
+    from .base import POLICY_DIR                                        # noqa: PLC0415
+    try:
+        with open(os.path.join(POLICY_DIR, repo.split("/")[-1] + ".json"), encoding="utf-8") as fh:
+            return str((json.load(fh) or {}).get(key) or default)
+    except Exception:                                                   # noqa: BLE001
+        return default
+
+
+def drift(path: str, env: str, prod: str) -> int:
+    """Non-merge commits on origin/<prod> that origin/<env> lacks; -1 when it cannot be measured.
+    Merge commits carry no code of their own, so GitHub's merge bubbles do not count."""
+    r = _git(path, "rev-list", "--count", "--no-merges", f"origin/{env}..origin/{prod}")
+    return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else -1
+
+
+def _foreign_commits(path: str, head: str, prod: str, ticket: str) -> list:
+    """Commits on the ticket branch that are not the ticket's (R1). A commit is the ticket's when
+    its subject names the ticket or it carries the gate's Fleet-Unit trailer. A merge is allowed
+    only as a base update: merging production into the branch (its other parent is on prod)."""
+    out = []
+    for line in _git(path, "log", "--format=%H%x09%P%x09%s%x09%b%x1e",
+                     f"origin/{prod}..{head}").stdout.split("\x1e"):
+        line = line.strip("\n")
+        if not line.strip():
+            continue
+        sha, parents, subject, body = (line.split("\t", 3) + ["", "", ""])[:4]
+        ps = parents.split()
+        if len(ps) > 1:
+            if not all(_git(path, "merge-base", "--is-ancestor", p, f"origin/{prod}").returncode == 0
+                       or _git(path, "merge-base", "--is-ancestor", p, head).returncode == 0
+                       for p in ps[1:]):
+                out.append({"sha": sha[:12], "subject": subject[:100],
+                            "why": "a merge that brings in something other than production"})
+            continue
+        if ticket in subject.upper() or FLEET_TRAILER in body:
+            continue
+        out.append({"sha": sha[:12], "subject": subject[:100],
+                    "why": f"neither names {ticket} nor carries the {FLEET_TRAILER} trailer"})
+    return out
+
+
+def _stage_blobs(wt: str, p: str) -> dict:
+    """{base, ours, theirs} blob ids of an unmerged path ('' where a side is absent)."""
+    blobs = {"1": "", "2": "", "3": ""}
+    for line in _git(wt, "ls-files", "-u", "--", p).stdout.splitlines():
+        meta, _, _ = line.partition("\t")
+        parts = meta.split()
+        if len(parts) == 3:
+            blobs[parts[2]] = parts[1]
+    return {"base": blobs["1"], "ours": blobs["2"], "theirs": blobs["3"]}
+
+
+def _who_changed(wt: str, env: str, prod: str, p: str) -> tuple:
+    """(tickets, outside_authors, all_authors) for unshipped env commits touching `p`."""
+    tickets, outside, authors = set(), set(), set()
+    for rec in _git(wt, "log", "--no-merges", "--format=%an%x09%s%x09%b%x1e",
+                    f"origin/{prod}..origin/{env}", "--", p).stdout.split("\x1e"):
+        rec = rec.strip("\n")
+        if not rec.strip():
+            continue
+        author, subject, body = (rec.split("\t", 2) + ["", ""])[:3]
+        authors.add(author)
+        tickets.update(TICKET_KEY_RE.findall(subject.upper()))
+        if FLEET_TRAILER not in body:
+            outside.add(author)
+    return sorted(tickets), outside, sorted(authors)
+
+
+async def _recipe(conn, repo, ticket, env, p, blobs, conflict_text, tickets, authors) -> dict:
+    """The recipe row for this exact conflict, recorded if new. Never resolves anything itself."""
+    row = await conn.fetchrow(
+        """SELECT id, state, resolved, decided_by FROM repo_conflict_recipes
+            WHERE repo = $1 AND path = $2 AND base_blob = $3 AND ours_blob = $4 AND theirs_blob = $5""",
+        repo, p, blobs["base"], blobs["ours"], blobs["theirs"])
+    if row:
+        return dict(row)
+    row = await conn.fetchrow(
+        """INSERT INTO repo_conflict_recipes
+               (repo, path, ticket, env, base_blob, ours_blob, theirs_blob, conflict,
+                other_tickets, other_authors)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           ON CONFLICT (repo, path, base_blob, ours_blob, theirs_blob) DO UPDATE SET env = EXCLUDED.env
+           RETURNING id, state, resolved, decided_by""",
+        repo, p, ticket, env, blobs["base"], blobs["ours"], blobs["theirs"], conflict_text[:20000],
+        tickets, authors)
+    return dict(row)
+
+
+async def land_merge(path: str, auth: str, scrub, env: str, ticket: str, repo: str, prod: str,
+                     policy: dict, profile_slug: str) -> tuple:
+    """(ok, payload). Lands bot/<ticket> on <env> by merge; see the block comment above."""
+    from .base import path_in_fence                                     # noqa: PLC0415
+    head = f"origin/bot/{ticket}"
+    if not _blob(path, f"{head}^{{commit}}"):
+        return False, f"bot/{ticket} is not on the remote: the dev pushes the branch first"
+
+    foreign = _foreign_commits(path, head, prod, ticket)
+    if foreign:
+        return False, {"error": f"bot/{ticket} carries commits that are not {ticket}'s; nothing "
+                                "was landed (One Track R1: a ticket branch holds only its ticket).",
+                       "foreign_commits": foreign,
+                       "next": "The dev removes them from the branch, or a person decides."}
+    ticket_files = _git(path, "diff", "--name-only", f"origin/{prod}...{head}").stdout.split()
+    fenced = [f for f in ticket_files if not path_in_fence(f, policy.get("fleet_paths") or [])]
+    if fenced:
+        return False, {"error": "files outside this repo's fleet_paths; nothing was landed.",
+                       "outside_fence": fenced, "fleet_paths": policy.get("fleet_paths")}
+
+    wt = os.path.join(tempfile.gettempdir(), f"land_{uuid.uuid4().hex[:12]}")
+    ident = git_env(git_identity(profile_slug))
+    applied, open_conflicts, foreign_hunks = [], [], []
+    try:
+        r = git_run(["git", "-C", path, "worktree", "add", "--detach", wt, f"origin/{env}"])
+        if r.returncode != 0:
+            return False, f"could not cut from origin/{env}: {scrub(r.stderr)[-300:]}"
+        base = _git(wt, "rev-parse", "HEAD").stdout.strip()
+        tip = _git(wt, "rev-parse", head).stdout.strip()
+        m = _git(wt, "merge", "--no-ff", "--no-commit", head, env=ident)
+        files = _git(wt, "diff", "--name-only", f"origin/{env}...{head}").stdout.split()
+        if m.returncode == 0:
+            _git(wt, "merge", "--abort")
+            return True, {"op": "land", "mode": "merge", "pr_head": f"bot/{ticket}", "base": env,
+                          "head_sha": tip[:12], "env_sha": base[:12], "files": files,
+                          "recipes_applied": [], "built": "attested on the branch; the merge "
+                          "is clean, so the deployed tree is env + exactly this branch"}
+
+        paths = _git(wt, "diff", "--name-only", "--diff-filter=U").stdout.split()
+        from ...db import get_pool                                      # noqa: PLC0415
+        pool = get_pool()
+        if not pool:
+            _git(wt, "merge", "--abort")
+            return False, "conflicts found and the recipe store is unavailable; nothing landed"
+        async with pool.acquire() as conn:
+            for p in paths:
+                blobs = _stage_blobs(wt, p)
+                tickets, outside, authors = _who_changed(wt, env, prod, p)
+                owners = set(policy.get("owners") or [])
+                if policy.get("shared") and (outside - owners):
+                    foreign_hunks.append({"path": p, "changed_by": sorted(outside - owners),
+                                          "tickets": tickets})
+                    continue
+                text = open(os.path.join(wt, p), encoding="utf-8", errors="replace").read() \
+                    if os.path.exists(os.path.join(wt, p)) else ""
+                rec = await _recipe(conn, repo, ticket, env, p, blobs, text, tickets, authors)
+                if rec["state"] == "approved":
+                    with open(os.path.join(wt, p), "w", encoding="utf-8", newline="") as fh:
+                        fh.write(rec["resolved"])
+                    _git(wt, "add", "--", p)
+                    applied.append({"path": p, "recipe": str(rec["id"]),
+                                    "approved_by": rec["decided_by"]})
+                else:
+                    open_conflicts.append({"path": p, "recipe": str(rec["id"]),
+                                           "state": rec["state"], "other_tickets": tickets,
+                                           "changed_by": authors})
+            if foreign_hunks or open_conflicts:
+                _git(wt, "merge", "--abort")
+                return False, {
+                    "error": f"bot/{ticket} conflicts with {env}; nothing was landed.",
+                    "foreign_hunks": foreign_hunks, "needs_recipe": open_conflicts,
+                    "recipes_applied_before_stopping": applied,
+                    "next": ("foreign_hunks: another developer's change. A person decides; no "
+                             "recipe may resolve it. needs_recipe: propose the resolved file "
+                             "with repo_recipe op=propose recipe_id=<id>; a person approves it, "
+                             "then land again.")}
+            msg = (f"Land {ticket} on {env} (merge of bot/{ticket})\n\n"
+                   + "\n".join(f"Recipe {a['recipe']} for {a['path']} (approved by "
+                               f"{a['approved_by']})" for a in applied))
+            c = _git(wt, "commit", "--no-edit", "-m", msg, env=ident)
+            if c.returncode != 0:
+                _git(wt, "merge", "--abort")
+                return False, f"merge commit failed: {scrub(c.stderr)[-300:]}"
+            for a in applied:
+                await conn.execute("UPDATE repo_conflict_recipes SET used_count = used_count + 1, "
+                                   "last_used_at = now() WHERE id = $1::uuid", a["recipe"])
+        landing = f"bot/{ticket}-{env}"
+        merged = _git(wt, "rev-parse", "HEAD").stdout.strip()
+        r = _git(wt, "branch", "-f", landing, merged)
+        if r.returncode != 0:
+            return False, f"could not point {landing} at the merge: {scrub(r.stderr)[-300:]}"
+    finally:
+        git_run(["git", "-C", path, "worktree", "remove", "--force", wt])
+        shutil.rmtree(wt, ignore_errors=True)
+    # A landing branch holds only env + this merge and is rebuilt on every land, so it is
+    # pushed with lease (the gate's one force-pushable bot ref).
+    r = _push_landing(path, auth, landing)
+    if r.returncode != 0:
+        return False, f"push of {landing} failed: {scrub((r.stderr or '') + (r.stdout or ''))[-400:]}"
+    return True, {"op": "land", "mode": "merge+recipes", "pr_head": landing, "base": env,
+                  "head_sha": tip[:12], "env_sha": base[:12], "merge_sha": merged[:12],
+                  "files": files, "recipes_applied": applied}
+
+
+async def land(path: str, auth: str, scrub, env: str, ticket: str, commits: list,
+               verified: str, profile_slug: str, repo: str = "") -> tuple:
+    """(ok, payload). One Track dispatcher: merge when the policy allows and drift is 0,
+    otherwise the own-commits fallback. The payload always says which and why (auditable)."""
+    from .base import branching_policy                                   # noqa: PLC0415
+    if env not in ENVS:
+        return False, f"land targets testing or staging, not {env!r}"
+    policy, problems = branching_policy(repo) if repo else (None, ["no repo named"])
+    prod = _policy_value(repo, "prod_branch", "production") if repo else "production"
+    r = git_run(["git", "-C", path, "fetch", auth, "+refs/heads/*:refs/remotes/origin/*"],
+                timeout=300)
+    if r.returncode != 0:
+        return False, f"fetch failed: {scrub(r.stderr)[-400:]}"
+    mode = (policy or {}).get("landing", "own_commits")
+    d = drift(path, env, prod)
+    if mode == "auto":
+        mode = "merge" if d == 0 else "own_commits"
+    why = {"policy": {k: v for k, v in (policy or {}).items() if k != "owners"},
+           "policy_problems": problems, "drift": d, "prod_branch": prod, "chosen": mode}
+    if mode == "merge":
+        ok, payload = await land_merge(path, auth, scrub, env, ticket, repo, prod,
+                                       policy or {}, profile_slug)
+    else:
+        if not commits:
+            commits = _git(path, "rev-list", "--reverse", "--no-merges",
+                           f"origin/{prod}..origin/bot/{ticket}").stdout.split()
+        ok, payload = await land_own_commits(path, auth, scrub, env, ticket, commits, verified,
+                                             profile_slug)
+    if isinstance(payload, dict):
+        payload["landing_decision"] = why
+    else:
+        payload = {"error": payload, "landing_decision": why}
+    return ok, payload
