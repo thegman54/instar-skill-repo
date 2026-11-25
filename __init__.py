@@ -24,8 +24,10 @@ from .repo_branch import RepoBranchTool
 from .repo_actions import RepoActionsTool
 from .ticket_precedent import TicketPrecedentTool
 from .repo_locate import RepoLocateTool
+from .repo_recipe import RepoRecipeTool
 
 __all__ = [
+    'RepoRecipeTool',
     'TicketPrecedentTool',
     'RepoLocateTool',
     'RepoCloneTool',

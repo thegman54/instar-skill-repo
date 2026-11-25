@@ -573,11 +573,45 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
             return False, why
         from .repo_land import land                                     # noqa: PLC0415
         ok, payload = await land(path, auth, scrub, ref, ticket, commits or [], verified,
-                                 profile_slug)
-        if ok:
-            payload.update({"repo": repo, "why_allowed": why})
-            log.info("repo_git_land", repo=repo, branch=landing, picks=len(commits or []))
-            tell_coordinator(repo, landing, payload.get("head", ""), profile_slug)
+                                 profile_slug, repo=repo)
+        if not ok:
+            return ok, payload
+        payload.update({"repo": repo, "why_allowed": why})
+        log.info("repo_git_land", repo=repo, ticket=ticket, env=ref,
+                 mode=(payload.get("landing_decision") or {}).get("chosen"))
+        # D15: landing OPENS the PR. The person's merge is the one gate, so the request has to
+        # carry everything needed to audit it: how it landed and why, the exact commits, and
+        # any recipe with who approved it. Composed from the fleet's record, plus this.
+        head = payload.get("pr_head") or payload.get("branch") or landing
+        _t, _b = await _fleet_pr_text(repo, head)
+        dec = payload.get("landing_decision") or {}
+        audit = [
+            "", "---", "**Landing record (fleet)**",
+            f"- mode: `{dec.get('chosen')}` (policy landing `{(dec.get('policy') or {}).get('landing')}`, "
+            f"drift {dec.get('drift')} on `{ref}` vs `{dec.get('prod_branch')}`)",
+            f"- head: `{head}` @ {payload.get('head_sha') or payload.get('head')}, "
+            f"`{ref}` @ {payload.get('env_sha') or payload.get('cut_from')}",
+        ]
+        for a in payload.get("recipes_applied") or []:
+            audit.append(f"- recipe `{a['recipe']}` for `{a['path']}`, approved by {a['approved_by']}")
+        if dec.get("policy_problems"):
+            audit.append("- policy fell back to safest: " + "; ".join(dec["policy_problems"]))
+        files = payload.get("files") or []
+        audit.append(f"- files ({len(files)}): " + ", ".join(
+            (f if isinstance(f, str) else f.get("path", "")) for f in files[:40]))
+        audit.append("- landed by: " + (profile_slug or "unknown"))
+        pr_ok, pr = await _decide(repo, "pr", head, profile_slug, token, ticket, ref,
+                                  _t, (_b or "") + "\n".join(audit))
+        payload["pr"] = pr if pr_ok else {"error": pr}
+        if not pr_ok:
+            log.warning("repo_git_land_pr_failed", repo=repo, ticket=ticket, error=str(pr)[:200])
+        # What repo_git_decisions keeps for this land (remote_op records why_allowed).
+        payload["why_allowed"] = json.dumps({
+            "allowed": why, "mode": dec.get("chosen"), "drift": dec.get("drift"),
+            "head": head, "head_sha": payload.get("head_sha") or payload.get("head"),
+            "recipes": [a.get("recipe") for a in payload.get("recipes_applied") or []],
+            "pr": (pr.get("url") if pr_ok and isinstance(pr, dict) else f"FAILED: {str(pr)[:160]}"),
+        })[:1900]
         return ok, payload
 
     # ---------------------------------------------------------------- pr
