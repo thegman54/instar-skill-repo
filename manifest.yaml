@@ -13,3 +13,8 @@ admin_api: admin_api.py
 credentials:
   - key: GITHUB_TOKEN
     description: GitHub Personal Access Token for clone/push operations
+
+# Rules every bot carrying these tools starts with (fleet triage 2026-11-25, D1). The runner adds
+# this section to the startup prompt of any profile whose tool belt includes a repo_* tool.
+claudemd:
+  section_file: claudemd_branching.md
