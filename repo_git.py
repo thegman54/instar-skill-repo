@@ -453,10 +453,12 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
                   token: str = None, ticket_hint: str = "", base: str = "",
                   title: str = "", body: str = "", draft: bool = False,
                   commits: list = None, verified: str = "", number: int = 0,
-                  reason: str = "") -> tuple:
-    """The decision itself, with no knowledge of how it gets recorded."""
-    if op not in ("fetch", "push", "promote", "pr", "land", "close"):
-        return False, f"unknown op {op!r} — expected fetch, push, promote, pr, land or close"
+                  reason: str = "", via_land: bool = False) -> tuple:
+    """The decision itself, with no knowledge of how it gets recorded. `via_land` is set only
+    by op=land's own PR call (D15), never from the tool's input."""
+    if op not in ("fetch", "push", "promote", "pr", "land", "close", "update_base"):
+        return False, (f"unknown op {op!r} — expected fetch, push, promote, pr, land, close "
+                       "or update_base")
 
     valid, path, _access, error, _branch = await check_repo_access(
         repo, "read" if op == "fetch" else "push", profile_slug)
@@ -563,6 +565,21 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
     # ---------------------------------------------------------------- land
     # Cut bot/<TICKET>-<env> from <env> and cherry-pick the ticket's commits (repo_land.py).
     # Same authority as pushing that landing branch: an open unit for the ticket.
+    if op == "update_base":
+        # One Track R2: a branch that has landed anywhere is brought up to date by MERGING
+        # production into it, never by rebase (its commits are already in an environment).
+        ticket = (ticket_hint or bot_ticket(ref)[0] or "").strip().upper()
+        if not TICKET_RE.match(ticket):
+            return False, "update_base needs `ticket` (or ref=bot/<TICKET>)"
+        allowed, why = await may_push(repo, f"bot/{ticket}")
+        if not allowed:
+            return False, why
+        from .repo_land import update_base                              # noqa: PLC0415
+        ok, payload = await update_base(path, auth, scrub, ticket, repo, profile_slug)
+        if ok and isinstance(payload, dict):
+            payload.update({"repo": repo, "why_allowed": why})
+        return ok, payload
+
     if op == "land":
         ticket = (ticket_hint or "").strip().upper()
         if not TICKET_RE.match(ticket):
@@ -601,7 +618,7 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
             (f if isinstance(f, str) else f.get("path", "")) for f in files[:40]))
         audit.append("- landed by: " + (profile_slug or "unknown"))
         pr_ok, pr = await _decide(repo, "pr", head, profile_slug, token, ticket, ref,
-                                  _t, (_b or "") + "\n".join(audit))
+                                  _t, (_b or "") + "\n".join(audit), via_land=True)
         payload["pr"] = pr if pr_ok else {"error": pr}
         if not pr_ok:
             log.warning("repo_git_land_pr_failed", repo=repo, ticket=ticket, error=str(pr)[:200])
@@ -672,8 +689,11 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         #
         # Unknown does not pass. If the registry cannot be read, nobody is named as the
         # expert and this cannot tell whether the caller is it.
-        expert = await _registered_expert(repo.split("/")[-1])
-        if not expert:
+        # One exception (D15, 2026-11-25): op=land opens the PR itself, with a body the FLEET
+        # composes (_fleet_pr_text) plus the landing record. Nobody is summarising a decision
+        # they did not make, which is what this rule guards against.
+        expert = "" if via_land else await _registered_expert(repo.split("/")[-1])
+        if not expert and not via_land:
             return False, ("cannot read which profile is the registered expert for "
                            f"{repo.split('/')[-1]}, so whether you are allowed to open this "
                            "request cannot be decided. Refusing rather than assuming.")
@@ -695,6 +715,25 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         # A landing branch is cut from ONE environment and goes back into that one only.
         # CLC-4615, 2026-11-16: bot/CLC-4615-testing (cut from testing) was opened into
         # staging and carried all of testing with it: 529 files, +18,881/-3,458.
+        # ONE TRACK, production (rule R3/R5): production receives only a ticket's own branch,
+        # and only once everything on it has passed through staging. A landing branch (cut
+        # from testing or staging) or any other head would carry that environment's history.
+        from .repo_land import _policy_value, _git as _lgit             # noqa: PLC0415
+        prod = _policy_value(repo, "prod_branch", "production")
+        if base == prod:
+            t, lsuffix = bot_ticket(ref)
+            if not t or lsuffix:
+                return False, (f"into {prod}, the head must be bot/<TICKET> itself (got {ref}). "
+                               "Landing branches carry an environment's history.")
+            git_run(["git", "-C", path, "fetch", auth, "+refs/heads/*:refs/remotes/origin/*"],
+                    timeout=300)
+            missing = _lgit(path, "rev-list", "--no-merges", f"origin/staging..origin/{ref}"
+                            ).stdout.split()
+            if missing:
+                return False, (f"{len(missing)} commit(s) on {ref} are not on staging "
+                               f"({', '.join(m[:10] for m in missing[:5])}). Production takes "
+                               "only what staging has tested: land on staging first.")
+
         _, landing = bot_ticket(ref)
         if landing and landing != f"-{base}":
             return False, (f"{ref} is the {landing[1:]} landing branch: it was cut from "
@@ -887,39 +926,34 @@ class RepoGitTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Perform a remote git operation on a repository you own: `fetch`, `push` or "
-            "`pr`.\n\n"
-            "This is the ONLY path to a remote. Your container has no credential, so a plain "
-            "`git push` cannot authenticate — that is deliberate, not a misconfiguration.\n\n"
-            "What is allowed:\n"
-            "  fetch                — always\n"
-            "  push bot/<TICKET>    — only if an OPEN work unit exists for this repo and ticket\n"
-            "  push bot/<TICKET>-testing — the same unit's TESTING LANDING branch: cut from "
-            "testing, carrying only the unit's commits testing lacks. Use it when "
-            "bot/<TICKET> no longer merges cleanly into testing (a second round after the "
-            "first landed as cherry-picks). Rebuilt each round, so it force-pushes with lease\n"
-            "  push release/<KEY>   — only if this repo is a member of that release group\n"
-            "  land ref=<env> ticket=<KEY> commits=[...] — cut bot/<KEY>-<env> from <env> and "
-            "cherry-pick the ticket's commits onto it, in a scratch worktree. A conflict is "
-            "resolved only when provably exact (the env's file equals the verified env's file "
-            "before this ticket); otherwise it stops and returns both sides. Use it when "
-            "bot/<KEY> does not merge cleanly into <env>. It builds nothing.\n"
-            "  close number=<PR> reason=<why> — close a PR the fleet opened (head bot/...), "
-            "posting the reason; use it when a PR is replaced or wrong. Never a person's PR.\n\n"
-            "Always refused: environment branches (production, testing, staging, main), "
-            "deleting any ref, and force-pushing anything but a release or landing branch.\n\n"
-            "  pr                   — open a pull request from a branch you pushed into "
-            "another branch. Opening is allowed; MERGING stays a human decision, and the "
-            "fleet records the request so a delivery rung can observe it landing.\n\n"
-            "Promotion to an environment is NOT done here. It goes through the fleet's "
-            "approval, which fails closed.\n\n"
-            "A refusal is an answer, not an error to route around. It names the rule that "
-            "refused and what would satisfy it."
+            "Remote git for a repository you work in (One Track: the SAME commits reach every "
+            "environment, by merge). Your container has no credential; this is the only path "
+            "to a remote.\n\n"
+            "  fetch — always.\n"
+            "  push ref=bot/<TICKET> — needs an OPEN work unit for this repo and ticket. Never "
+            "rebase or force-push it once it has landed anywhere.\n"
+            "  update_base ticket=<KEY> — bring bot/<KEY> up to date by MERGING production into "
+            "it (never rebase). A conflict stops and names the files and commits: escalate.\n"
+            "  land ref=<testing|staging> ticket=<KEY> — deliver the ticket to that environment "
+            "AND open its PR (with the landing record in the body). The repo's policy decides "
+            "how: a clean merge opens the PR from bot/<KEY> itself; a conflict is resolved only "
+            "by a person-approved recipe for that exact conflict (see repo_recipe), else it "
+            "stops and names the other tickets; a hunk changed by someone outside the fleet "
+            "always stops. If the environment has drifted from production, it falls back to "
+            "carrying only the ticket's commits (commits=[...] optional). It builds nothing: "
+            "attest the build on bot/<KEY> first.\n"
+            "  pr ref=<head> base=<env> — open a PR yourself only when land cannot (e.g. into "
+            "production: head must be bot/<KEY> and every commit already on staging). "
+            "Merging is always a person's.\n"
+            "  close number=<PR> reason=<why> — close a PR the fleet opened; never a person's.\n"
+            "Always refused: pushing environment branches, deleting refs, force-pushing a ticket "
+            "branch. A refusal names the rule and what would satisfy it: it is an answer, not "
+            "something to route around."
         )
 
     @property
     def short_description(self) -> str:
-        return "Fetch, push or open a pull request, with server-side ref rules"
+        return "Fetch, push, update from production, land on an environment (opens the PR), close"
 
     @property
     def input_schema(self) -> dict:
@@ -928,7 +962,8 @@ class RepoGitTool(BaseTool):
             "properties": {
                 "repo": {"type": "string",
                          "description": "owner/repo, e.g. cenora-llc/cenora-core-data-services"},
-                "op": {"type": "string", "enum": ["fetch", "push", "pr", "land", "close"]},
+                "op": {"type": "string", "enum": ["fetch", "push", "pr", "land", "close",
+                                                  "update_base"]},
                 "ref": {"type": "string",
                         "description": "Branch to push, e.g. bot/CLC-4156. For fetch, the "
                                        "branch to fetch (optional; defaults to all). For "
@@ -942,15 +977,16 @@ class RepoGitTool(BaseTool):
                 "draft": {"type": "boolean",
                           "description": "pr only: open it as a draft. Default false."},
                 "ticket": {"type": "string",
-                           "description": "land only: the ticket, e.g. CLC-4615."},
+                           "description": "land / update_base: the ticket, e.g. CLC-4615."},
                 "number": {"type": "integer",
                            "description": "close only: the pull request number."},
                 "reason": {"type": "string",
                            "description": "close only: why, posted on the PR (what replaces "
                                           "it, e.g. 'replaced by #268')."},
                 "commits": {"type": "array", "items": {"type": "string"},
-                            "description": "land only: the ticket's commit shas, in the "
-                                           "order to apply them."},
+                            "description": "land only, optional: the ticket's commit shas, "
+                                           "used only when the landing falls back to "
+                                           "carrying commits (drift)."},
                 "verified": {"type": "string",
                              "description": "land only: the environment where this work is "
                                             "already verified (default testing when landing "

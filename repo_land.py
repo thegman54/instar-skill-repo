@@ -471,3 +471,54 @@ async def land(path: str, auth: str, scrub, env: str, ticket: str, commits: list
     else:
         payload = {"error": payload, "landing_decision": why}
     return ok, payload
+
+
+async def update_base(path: str, auth: str, scrub, ticket: str, repo: str,
+                      profile_slug: str) -> tuple:
+    """(ok, payload). Bring bot/<ticket> up to date with production by MERGING origin/<prod> into
+    it (One Track R2: never rebase a branch that has landed anywhere; its commits are already in
+    environments, and a rebase would make copies). Done in a scratch tree and pushed as a normal
+    fast-forward. A conflict stops: nothing is pushed and the report names the production
+    commits involved."""
+    prod = _policy_value(repo, "prod_branch", "production")
+    branch = f"bot/{ticket}"
+    r = git_run(["git", "-C", path, "fetch", auth, "+refs/heads/*:refs/remotes/origin/*"],
+                timeout=300)
+    if r.returncode != 0:
+        return False, f"fetch failed: {scrub(r.stderr)[-400:]}"
+    if not _blob(path, f"origin/{branch}^{{commit}}"):
+        return False, f"{branch} is not on the remote"
+    behind = _git(path, "rev-list", "--count", f"origin/{branch}..origin/{prod}").stdout.strip()
+    if behind == "0":
+        return True, {"op": "update_base", "branch": branch, "already_current": True,
+                      "prod_branch": prod}
+    wt = os.path.join(tempfile.gettempdir(), f"base_{uuid.uuid4().hex[:12]}")
+    ident = git_env(git_identity(profile_slug))
+    try:
+        r = git_run(["git", "-C", path, "worktree", "add", "--detach", wt, f"origin/{branch}"])
+        if r.returncode != 0:
+            return False, f"could not check out {branch}: {scrub(r.stderr)[-300:]}"
+        m = _git(wt, "merge", "--no-ff", "-m",
+                 f"Merge {prod} into {branch} (base update, One Track)", f"origin/{prod}",
+                 env=ident)
+        if m.returncode != 0:
+            paths = _git(wt, "diff", "--name-only", "--diff-filter=U").stdout.split()
+            causes = {p: _git(wt, "log", "--no-merges", "--format=%h %an %s",
+                              f"HEAD...origin/{prod}", "--", p).stdout.splitlines()[:6]
+                      for p in paths}
+            _git(wt, "merge", "--abort")
+            return False, {"error": f"merging {prod} into {branch} conflicts; nothing was pushed.",
+                           "conflicts": paths, "commits_on_each_side": causes,
+                           "next": "Escalate (needs_input + fleet_escalate) naming the files and "
+                                   "the production commits: a person decides."}
+        new = _git(wt, "rev-parse", "HEAD").stdout.strip()
+    finally:
+        git_run(["git", "-C", path, "worktree", "remove", "--force", wt])
+        shutil.rmtree(wt, ignore_errors=True)
+    r = git_run(["git", "-C", path, "push", auth, f"{new}:refs/heads/{branch}"], timeout=300)
+    if r.returncode != 0:
+        return False, f"push of {branch} failed: {scrub((r.stderr or '') + (r.stdout or ''))[-400:]}"
+    return True, {"op": "update_base", "branch": branch, "merged": f"origin/{prod}",
+                  "new_head": new[:12], "behind_before": int(behind or 0),
+                  "next": "Your tree is now behind the remote by this merge: fast-forward it "
+                          "(repo_clone refreshes it) before you commit again."}
