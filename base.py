@@ -458,3 +458,59 @@ def validate_ref(project_root: str, ref: str) -> tuple[bool, str]:
         return False, (f"Ref {ref!r} is not in this checkout. Remote branches are origin/<name>; "
                        "call repo_clone to fetch if it was pushed recently.")
     return True, ""
+
+
+# ---------------------------------------------------------------- branching policy (One Track)
+# The per-repo switch (fleet triage 2026-11-25, D13-D15; design section 9). It lives in the
+# gate policy, mounted outside every working tree, so a bot cannot change its own rules with a
+# commit. The admin UI owns it.
+POLICY_DIR = os.environ.get("REPO_POLICY_DIR", "/app/tools/repo_expert_runtime/expert-runner/policy")
+
+# UNKNOWN MEANS SAFEST. A repo without a `branching` block, an unreadable file, or a value this
+# code does not recognise lands only its own commits, only reports drift, and treats every hunk
+# outside the fleet as someone else's. A missing setting can never cause a merge or a back-merge.
+BRANCHING_SAFEST = {"landing": "own_commits", "drift_action": "report", "shared": True,
+                    "fleet_paths": [], "owners": []}
+_LANDING = {"merge", "own_commits", "auto"}
+_DRIFT = {"pr", "report"}
+
+
+def branching_policy(repo: str) -> tuple:
+    """(policy, problems). Always a usable policy; `problems` says what fell back to safest."""
+    import json                                                         # noqa: PLC0415
+    path = os.path.join(POLICY_DIR, repo.split("/")[-1] + ".json")
+    out, problems = dict(BRANCHING_SAFEST), []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            blk = (json.load(fh) or {}).get("branching")
+    except Exception as exc:                                            # noqa: BLE001
+        return out, [f"policy {path} unreadable ({str(exc)[:120]}): safest settings"]
+    if not isinstance(blk, dict):
+        return out, [f"policy {path} has no branching block: safest settings"]
+    if blk.get("landing") in _LANDING:
+        out["landing"] = blk["landing"]
+    elif "landing" in blk:
+        problems.append(f"landing {blk.get('landing')!r} unknown: own_commits")
+    if blk.get("drift_action") in _DRIFT:
+        out["drift_action"] = blk["drift_action"]
+    elif "drift_action" in blk:
+        problems.append(f"drift_action {blk.get('drift_action')!r} unknown: report")
+    if isinstance(blk.get("shared"), bool):
+        out["shared"] = blk["shared"]
+    for key in ("fleet_paths", "owners"):
+        val = blk.get(key)
+        if isinstance(val, list) and all(isinstance(v, str) for v in val):
+            out[key] = val
+        elif key in blk:
+            problems.append(f"{key} is not a list of strings: ignored")
+    return out, problems
+
+
+def path_in_fence(path: str, fleet_paths: list) -> bool:
+    """True when `path` is inside one of the policy's fleet_paths globs (empty list = whole repo).
+    `**` matches any depth; matching is on the repository-relative path."""
+    import fnmatch                                                      # noqa: PLC0415
+    if not fleet_paths:
+        return True
+    return any(fnmatch.fnmatchcase(path, g) or (g.endswith("/**") and path.startswith(g[:-2]))
+               for g in fleet_paths)
