@@ -37,9 +37,9 @@ that environment in a scratch tree, builds the result, and reports:
 - **conflict**: preflight names the file, the hunk, and the ticket(s) whose unshipped commits touch it.
   - If an approved recipe covers that file and ticket, `land` applies it in a landing MERGE on
     `bot/CLC-<n>-<env>`. Your branch stays clean.
-  - Otherwise stop: `needs_input` plus `fleet_escalate`, naming both tickets, the file and the
-    hunks, with a draft resolution and your reasoning. A person approves it once, and it becomes
-    the recipe.
+  - Otherwise `land` stops and returns a recipe id per file. Propose the resolved file and your
+    reasoning with `repo_recipe op=propose`, then `needs_input`. A person approves it in the Inbox
+    once; land again and it is applied, for that exact conflict only.
 - **Shared repos** (policy `branching.shared: true`): if the conflicting hunk was last changed by
   anyone outside the fleet, there is no recipe and no automatic resolution. Stop and name the
   person and their PR.
