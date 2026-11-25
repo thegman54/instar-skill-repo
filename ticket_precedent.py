@@ -50,6 +50,63 @@ def _git(args: list[str], cwd: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+ENV_REFS = ("production", "production-v2", "main", "master", "staging", "testing")
+
+
+def _patch_id(sha: str, cwd: str) -> str:
+    """The change's identity regardless of which branch carries it (git patch-id --stable):
+    a cherry-pick of a commit has the same patch-id as the original."""
+    try:
+        show = subprocess.run(["git", "show", "--format=", sha], cwd=cwd, capture_output=True,
+                              timeout=GIT_TIMEOUT, env=git_env())
+        pid = subprocess.run(["git", "patch-id", "--stable"], input=show.stdout, cwd=cwd,
+                             capture_output=True, timeout=GIT_TIMEOUT, env=git_env())
+        return (pid.stdout.decode().split() or [""])[0]
+    except subprocess.TimeoutExpired:
+        return ""
+
+
+def _envs_with(sha: str, cwd: str) -> list:
+    out = _git(["branch", "-r", "--contains", sha], cwd)
+    names = {l.strip().split("/", 1)[-1] for l in out.splitlines() if l.strip()}
+    return [e for e in ENV_REFS if e in names]
+
+
+def _norm_subject(subject: str) -> str:
+    return re.sub(r"\s*\(cherry picked from commit [0-9a-f]+\)\s*$", "", subject or "").strip().lower()
+
+
+def group_copies(rows: list, cwd: str) -> list:
+    """Fold copies of one change into one entry (One Track, fleet triage 2026-11-25).
+
+    Cherry-pick landings left each change as up to three commits (original, testing copy,
+    staging copy): CLC-4615 had 23 commits for 9 changes. Grouped by patch-id, and then by
+    subject for copies whose patch-id differs because a conflict was resolved while copying
+    (those say `matched_by: subject`, a weaker claim)."""
+    groups = []
+    by_pid, by_subj = {}, {}
+    for c in rows:
+        pid = _patch_id(c["sha"], cwd)
+        subj = _norm_subject(c["subject"])
+        g = by_pid.get(pid) if pid else None
+        how = "patch-id"
+        if g is None and subj in by_subj:
+            g, how = by_subj[subj], "subject"
+        if g is None:
+            g = {**c, "copies": [], "matched_by": "single", "on": []}
+            groups.append(g)
+        else:
+            g["matched_by"] = how if g["matched_by"] in ("single", how) else "patch-id+subject"
+        g["copies"].append({"sha": c["sha"], "date": c["date"], "author": c["author"]})
+        if pid:
+            by_pid[pid] = g
+        by_subj.setdefault(subj, g)
+    for g in groups:
+        g["on"] = sorted({e for cp in g["copies"] for e in _envs_with(cp["sha"], cwd)},
+                         key=ENV_REFS.index)
+    return groups
+
+
 @register_tool
 class TicketPrecedentTool(BaseTool):
     """Find the repository that has already been changed for a ticket, from git history."""
@@ -72,7 +129,10 @@ class TicketPrecedentTool(BaseTool):
             "no history of its own, and its parent's history is the whole point.\n\n"
             "No hits does not mean the work was not done: a checkout only knows what it has "
             "fetched, and a human may never have put the key in a commit message. Each repo "
-            "reports how far its history reaches so you can say which it was."
+            "reports how far its history reaches so you can say which it was.\n\n"
+            "Each entry is one CHANGE: its copies (cherry-picked onto other branches) are folded "
+            "into `copies`, and `on` lists the environment branches that carry it. Count "
+            "changes, not commits."
         )
 
     @property
@@ -177,16 +237,21 @@ class TicketPrecedentTool(BaseTool):
             # --all, because the branch that carries the fix is frequently not the one checked
             # out — and on a repo that promotes by cherry-pick the same subject appears three
             # times, which is itself the signal that it shipped.
-            out = _git(["log", "--all", f"-{limit}", f"--grep={key}", "--date=short",
+            # Read wider than `limit`, then fold copies: `limit` counts CHANGES, not commits.
+            out = _git(["log", "--all", "--no-merges", f"-{min(limit * 4, 60)}",
+                        f"--grep={key}", "--date=short",
                         "--format=%h\x1f%ad\x1f%an\x1f%s"], root)
+            rows = []
             for line in [l for l in out.splitlines() if l.strip()]:
                 sha, date, author, subject = (line.split("\x1f") + ["", "", ""])[:4]
-                commits.append({"key": key, "sha": sha, "date": date, "author": author,
-                                "subject": subject,
+                rows.append({"key": key, "sha": sha, "date": date, "author": author,
+                             "subject": subject})
+            for g in group_copies(rows, root)[:limit]:
+                commits.append({**g,
                                 # The files are the scope hint: CLC-4510 touched exactly one
                                 # file, which tells the next ticket where to start.
                                 "files": [f for f in _git(
-                                    ["show", "--stat=200", "--format=", "--name-only", sha],
+                                    ["show", "--stat=200", "--format=", "--name-only", g["sha"]],
                                     root).splitlines() if f.strip()][:20]})
             key_branches = []
             for line in _git(["branch", "-a", "--list", f"*{key}*"], root).splitlines():
