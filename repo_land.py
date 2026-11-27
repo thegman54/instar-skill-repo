@@ -31,6 +31,7 @@ It builds nothing: the result is reported as unbuilt, and the build is owed befo
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import uuid
 
@@ -467,9 +468,6 @@ async def land_merge(path: str, auth: str, scrub, env: str, ticket: str, repo: s
             if c.returncode != 0:
                 _git(wt, "merge", "--abort")
                 return False, f"merge commit failed: {scrub(c.stderr)[-300:]}"
-            for a in applied:
-                await conn.execute("UPDATE repo_conflict_recipes SET used_count = used_count + 1, "
-                                   "last_used_at = now() WHERE id = $1::uuid", a["recipe"])
         landing = f"bot/{ticket}-{env}"
         merged = _git(wt, "rev-parse", "HEAD").stdout.strip()
         net = _git(wt, "diff", "--name-only", base, merged).stdout.split()
@@ -480,6 +478,13 @@ async def land_merge(path: str, auth: str, scrub, env: str, ticket: str, repo: s
                     os.chmod(os.path.join(d, n), 0o777)
         verified_ok, verify_report = await _verify_in_runner(wt, path, repo, profile_slug)
         if not verified_ok:
+            if verify_report.get("error"):
+                # The check itself could not run: that says nothing about the recipe.
+                return False, {"error": "the merged tree could not be verified "
+                                        f"({verify_report['error']}); nothing was pushed.",
+                               "merged_verify": verify_report, "recipes_applied": applied,
+                               "next": "An infrastructure fault, not a wrong recipe: escalate "
+                                       "with this error."}
             return False, {"error": f"the merged tree (env + bot/{ticket} + approved recipes) does "
                                     "not pass the repo's verify; nothing was pushed.",
                            "merged_verify": verify_report, "recipes_applied": applied,
@@ -496,6 +501,11 @@ async def land_merge(path: str, auth: str, scrub, env: str, ticket: str, repo: s
     r = _push_landing(path, auth, landing)
     if r.returncode != 0:
         return False, f"push of {landing} failed: {scrub((r.stderr or '') + (r.stdout or ''))[-400:]}"
+    # Counted only once the merge that used them is pushed (a refused land used nothing).
+    async with pool.acquire() as conn:
+        for a in applied:
+            await conn.execute("UPDATE repo_conflict_recipes SET used_count = used_count + 1, "
+                               "last_used_at = now() WHERE id = $1::uuid", a["recipe"])
     return True, {"op": "land", "mode": "merge+recipes", "pr_head": landing, "base": env,
                   "head_sha": tip[:12], "env_sha": base[:12], "merge_sha": merged[:12],
                   "files": files, "net_files": net, "recipes_applied": applied,
