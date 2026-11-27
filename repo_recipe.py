@@ -7,10 +7,14 @@ and only then does `land` replay it, and only for that identical conflict.
 This tool proposes and reads. It never approves: that is a person's press.
 """
 
+import os
+
 from ..base import BaseTool, ToolResult
 from ..registry import register_tool
+from .base import check_repo_access, validate_path
 
 MARKERS = ("<<<<<<< ", "\n=======\n", ">>>>>>> ")
+MAX_CHECKOUT_BYTES = 5_000_000
 
 
 @register_tool
@@ -38,6 +42,9 @@ class RepoRecipeTool(BaseTool):
             "(what each side intended and how the result keeps both). A person approves it in "
             "the Inbox; then land again and it is applied. It replays only for this exact "
             "conflict.\n"
+            "  For a large file, resolve it in your checkout instead (edit the recipe's `path` "
+            "until it has no conflict markers, do not commit it) and pass `from_checkout: true` "
+            "with no `resolved`: the file is read from your checkout.\n"
             "Never propose for a hunk changed by someone outside the fleet (land reports those "
             "as foreign_hunks): that is a person's decision, not a recipe.")
 
@@ -52,6 +59,10 @@ class RepoRecipeTool(BaseTool):
                 "id": {"type": "string", "description": "recipe id (show, propose)"},
                 "resolved": {"type": "string", "description": "the whole resolved file (propose)"},
                 "reason": {"type": "string", "description": "why this resolution is right (propose)"},
+                "from_checkout": {"type": "boolean",
+                                  "description": "propose: read the resolved file from the "
+                                                 "recipe's path in your checkout instead of "
+                                                 "`resolved` (large files)"},
             },
             "required": ["op"],
         }
@@ -60,7 +71,8 @@ class RepoRecipeTool(BaseTool):
         return []
 
     async def execute(self, op: str, repo: str = "", ticket: str = "", id: str = "",
-                      resolved: str = "", reason: str = "", **kwargs) -> ToolResult:
+                      resolved: str = "", reason: str = "", from_checkout: bool = False,
+                      **kwargs) -> ToolResult:
         from ...db import get_pool                                      # noqa: PLC0415
         pool = get_pool()
         if not pool:
@@ -93,6 +105,12 @@ class RepoRecipeTool(BaseTool):
             if op == "propose":
                 if row["state"] == "approved":
                     return ToolResult.fail("already approved; land again to apply it")
+                if from_checkout and not resolved:
+                    # CLC-4673, 2026-11-25: the staging conflict's file was too large to pass
+                    # whole as an argument, so no recipe could be proposed at all (#108).
+                    resolved, error = await self._read_checkout(row)
+                    if error:
+                        return ToolResult.fail(error)
                 if not resolved.strip() or len((reason or "").strip()) < 20:
                     return ToolResult.fail("propose needs the whole `resolved` file and a "
                                            "`reason` (a sentence or more: what each side "
@@ -111,3 +129,21 @@ class RepoRecipeTool(BaseTool):
                                               "Then land again: it applies to this exact "
                                               "conflict only."})
         return ToolResult.fail(f"unknown op {op!r}: list, show or propose")
+
+    async def _read_checkout(self, row) -> tuple[str, str]:
+        """(file text, error) of the recipe's path in the caller's checkout (its unit tree if any)."""
+        repo = str(row["repo"]).split("/")[-1]
+        valid, root, _access, error, _branch = await check_repo_access(
+            repo, "read", self._profile_slug, self._session_id, self._gatekeeper_url)
+        if not valid:
+            return "", error
+        valid, path, error = validate_path(root, row["path"])
+        if not valid:
+            return "", f"{row['path']}: {error}"
+        try:
+            if os.path.getsize(path) > MAX_CHECKOUT_BYTES:
+                return "", f"{row['path']} is over {MAX_CHECKOUT_BYTES // 1_000_000} MB"
+            with open(path, encoding="utf-8") as fh:
+                return fh.read(), ""
+        except OSError as exc:
+            return "", f"{row['path']} could not be read from your checkout ({exc})"
