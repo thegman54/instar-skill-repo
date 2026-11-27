@@ -334,6 +334,49 @@ async def _recipe(conn, repo, ticket, env, p, blobs, conflict_text, tickets, aut
     return dict(row)
 
 
+VERIFY_SCRIPT = r'''
+import json, os, subprocess, sys, time
+wt, root, pol_path = sys.argv[1], sys.argv[2], sys.argv[3]
+pol = json.load(open(pol_path)) if os.path.exists(pol_path) else {}
+nm = os.path.join(root, "node_modules")
+if os.path.isdir(nm) and not os.path.exists(os.path.join(wt, "node_modules")):
+    os.symlink(nm, os.path.join(wt, "node_modules"))
+out = []
+for cmd in pol.get("verify") or []:
+    if cmd and cmd[0] in ("npm", "yarn", "pnpm") and any(x in ("install", "i", "ci") for x in cmd[1:]):
+        continue
+    t = time.time()
+    p = subprocess.run(cmd, cwd=wt, capture_output=True, text=True, timeout=900)
+    out.append({"cmd": " ".join(cmd), "exit": p.returncode, "seconds": round(time.time() - t, 1),
+                "tail": ((p.stdout or "") + (p.stderr or ""))[-1500:]})
+    if p.returncode != 0:
+        break
+print(json.dumps({"ran": out, "ok": bool(out) and all(o["exit"] == 0 for o in out)}))
+'''
+
+
+async def _verify_in_runner(wt: str, path: str, repo: str, profile_slug: str) -> tuple:
+    """(ok, report): the repo's own verify commands run on the MERGED tree in the expert runner
+    (#102, TB-9201 proof 2026-11-27). A recipe makes the deployed tree env + branch + a
+    resolution that no gate has built; this is that build. No verify commands = not ok."""
+    import asyncio as _a                                                # noqa: PLC0415
+    import json as _j                                                   # noqa: PLC0415
+    from .repo_preflight import RUNNER_USER, _runner_for                # noqa: PLC0415
+    runner = await _runner_for(profile_slug or "")
+    pol = "/gate/policies/" + repo.split("/")[-1] + ".json"
+    cmd = ["docker", "exec", "-i", "-u", RUNNER_USER, runner, "python3", "-", wt, path, pol]
+    try:
+        proc = await _a.get_running_loop().run_in_executor(
+            None, lambda: subprocess.run(cmd, input=VERIFY_SCRIPT, capture_output=True, text=True,
+                                         timeout=1800))
+        data = _j.loads((proc.stdout or "").strip().splitlines()[-1])
+    except Exception as exc:                                            # noqa: BLE001
+        return False, {"error": f"could not run verify in {runner}: {str(exc)[:200]}"}
+    if not data.get("ran"):
+        data["error"] = "the policy names no verify commands, so the merged tree is unverified"
+    return bool(data.get("ok")), data
+
+
 async def land_merge(path: str, auth: str, scrub, env: str, ticket: str, repo: str, prod: str,
                      policy: dict, profile_slug: str) -> tuple:
     """(ok, payload). Lands bot/<ticket> on <env> by merge; see the block comment above."""
@@ -354,7 +397,10 @@ async def land_merge(path: str, auth: str, scrub, env: str, ticket: str, repo: s
         return False, {"error": "files outside this repo's fleet_paths; nothing was landed.",
                        "outside_fence": fenced, "fleet_paths": policy.get("fleet_paths")}
 
-    wt = os.path.join(tempfile.gettempdir(), f"land_{uuid.uuid4().hex[:12]}")
+    # In the WORKSPACE, not /tmp: a recipe merge is built by the expert runner, which sees
+    # /projects/workspaces at the same path (it does not see the executor's /tmp).
+    wt = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(path))),
+                      f".land-{uuid.uuid4().hex[:12]}")
     ident = git_env(git_identity(profile_slug))
     applied, open_conflicts, foreign_hunks = [], [], []
     try:
@@ -366,9 +412,13 @@ async def land_merge(path: str, auth: str, scrub, env: str, ticket: str, repo: s
         m = _git(wt, "merge", "--no-ff", "--no-commit", head, env=ident)
         files = _git(wt, "diff", "--name-only", f"origin/{env}...{head}").stdout.split()
         if m.returncode == 0:
+            # What the PR will actually change on the environment (files the env already has
+            # identically drop out), next to the ticket's own files.
+            net = _git(wt, "diff", "--cached", "--name-only").stdout.split()
             _git(wt, "merge", "--abort")
             return True, {"op": "land", "mode": "merge", "pr_head": f"bot/{ticket}", "base": env,
                           "head_sha": tip[:12], "env_sha": base[:12], "files": files,
+                          "net_files": net,
                           "recipes_applied": [], "built": "attested on the branch; the merge "
                           "is clean, so the deployed tree is env + exactly this branch"}
 
@@ -422,6 +472,19 @@ async def land_merge(path: str, auth: str, scrub, env: str, ticket: str, repo: s
                                    "last_used_at = now() WHERE id = $1::uuid", a["recipe"])
         landing = f"bot/{ticket}-{env}"
         merged = _git(wt, "rev-parse", "HEAD").stdout.strip()
+        net = _git(wt, "diff", "--name-only", base, merged).stdout.split()
+        os.chmod(wt, 0o777)
+        for d, subdirs, _f in os.walk(wt):
+            for n in subdirs:
+                if n != ".git":
+                    os.chmod(os.path.join(d, n), 0o777)
+        verified_ok, verify_report = await _verify_in_runner(wt, path, repo, profile_slug)
+        if not verified_ok:
+            return False, {"error": f"the merged tree (env + bot/{ticket} + approved recipes) does "
+                                    "not pass the repo's verify; nothing was pushed.",
+                           "merged_verify": verify_report, "recipes_applied": applied,
+                           "next": "The resolution is wrong for this tree: propose a corrected "
+                                   "recipe (repo_recipe op=propose), or escalate."}
         r = _git(wt, "branch", "-f", landing, merged)
         if r.returncode != 0:
             return False, f"could not point {landing} at the merge: {scrub(r.stderr)[-300:]}"
@@ -435,7 +498,10 @@ async def land_merge(path: str, auth: str, scrub, env: str, ticket: str, repo: s
         return False, f"push of {landing} failed: {scrub((r.stderr or '') + (r.stdout or ''))[-400:]}"
     return True, {"op": "land", "mode": "merge+recipes", "pr_head": landing, "base": env,
                   "head_sha": tip[:12], "env_sha": base[:12], "merge_sha": merged[:12],
-                  "files": files, "recipes_applied": applied}
+                  "files": files, "net_files": net, "recipes_applied": applied,
+                  "merged_verify": {k: verify_report.get(k) for k in ("ok",)} | {
+                      "ran": [{"cmd": o["cmd"], "exit": o["exit"]}
+                              for o in verify_report.get("ran", [])]}}
 
 
 async def land(path: str, auth: str, scrub, env: str, ticket: str, commits: list,

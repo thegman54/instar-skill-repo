@@ -604,7 +604,7 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         dec = payload.get("landing_decision") or {}
         audit = [
             "", "---", "**Landing record (fleet)**",
-            f"- mode: `{dec.get('chosen')}` (policy landing `{(dec.get('policy') or {}).get('landing')}`, "
+            f"- mode: `{payload.get('mode') or dec.get('chosen')}` (policy landing `{(dec.get('policy') or {}).get('landing')}`, "
             f"drift {dec.get('drift')} on `{ref}` vs `{dec.get('prod_branch')}`)",
             f"- head: `{head}` @ {payload.get('head_sha') or payload.get('head')}, "
             f"`{ref}` @ {payload.get('env_sha') or payload.get('cut_from')}",
@@ -614,8 +614,18 @@ async def _decide(repo: str, op: str, ref: str = "", profile_slug: str = "",
         if dec.get("policy_problems"):
             audit.append("- policy fell back to safest: " + "; ".join(dec["policy_problems"]))
         files = payload.get("files") or []
-        audit.append(f"- files ({len(files)}): " + ", ".join(
+        audit.append(f"- the ticket's files ({len(files)}): " + ", ".join(
             (f if isinstance(f, str) else f.get("path", "")) for f in files[:40]))
+        if "net_files" in payload:
+            net = payload["net_files"] or []
+            audit.append(f"- what this PR changes on `{ref}` ({len(net)}): "
+                         + (", ".join(net[:40]) or "nothing (already identical)"))
+        mv = payload.get("merged_verify")
+        if mv:
+            audit.append("- merged tree verified: "
+                         + ("passed" if mv.get("ok") else "FAILED") + " ("
+                         + "; ".join(f"{o['cmd']} exit {o['exit']}" for o in mv.get("ran") or [])
+                         + ")")
         audit.append("- landed by: " + (profile_slug or "unknown"))
         pr_ok, pr = await _decide(repo, "pr", head, profile_slug, token, ticket, ref,
                                   _t, (_b or "") + "\n".join(audit), via_land=True)
