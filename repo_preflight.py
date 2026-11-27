@@ -379,7 +379,9 @@ class RepoPreflightTool(BaseTool):
                        "never rebase it. `repo_git op=land` records each conflict for a "
                        "recipe (repo_recipe) a person approves; a file changed by someone "
                        "outside the fleet is a person's decision. If the conflict is with "
-                       "production itself, `repo_git op=update_base` first."
+                       "production itself, `repo_git op=update_base` first. Next: run "
+                       "`repo_git op=land` now (it records the conflict, changes nothing), then "
+                       "`repo_recipe op=propose` for each recipe id it returns."
                        % (testing_branch.upper(), len(data.get("conflicts") or []),
                           ", ".join((data.get("conflicts") or [])[:12]), testing_branch,
                           named or "not determined", testing_branch))
